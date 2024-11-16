@@ -100,6 +100,12 @@ async def on_message(message):
         return
 
     if message.content.startswith(';'):
+        # Skip the chart logic if it's a bot command
+        if message.content.startswith((';setchannel', ';removechannel', ';events')):
+            await bot.process_commands(message)
+            return
+            
+        # Handle chart commands
         parts = message.content[1:].split()
         if len(parts) == 2:
             ticker, timeframe = parts
@@ -107,7 +113,7 @@ async def on_message(message):
         else:
             await message.channel.send("Invalid command. Use format: ;ticker timeframe (e.g., ;aapl d, ;aapl w, ;aapl m)")
     
-    # This line is important to process commands
+    # Process other commands
     await bot.process_commands(message)
 
 async def send_chart(channel, ticker: str, timeframe: str):
