@@ -66,24 +66,66 @@ Track important economic indicators:
 
 ## 📈 Tracked Economic Indicators
 
-### High Impact
+### High Impact Events
 - Consumer Price Index (CPI)
+- Core CPI (excluding Food & Energy)
 - Nonfarm Payroll
+- Unemployment Rate
 - GDP
 - Federal Funds Rate
 
-### Market Data
-- VIX Index
+### Production & Sales
+- Industrial Production Index
+- Retail Sales
+- Real Retail Sales
+
+### Market Indicators
+- VIX Volatility Index
 - US Dollar Index
-- Crude Oil
+- Crude Oil WTI
 - Gold Price
 
-### Other Indicators
-- Treasury Rates
-- Fed Balance Sheet
-- Jobless Claims
-- Housing Data
-- And many more!
+### Interest Rates & Spreads
+- 2-Year Treasury Rate
+- 10-Year Treasury Rate
+- 10Y-2Y Treasury Spread
+
+### Fed Related Data
+- Fed Balance Sheet Total Assets
+- Velocity of M2 Money Stock
+- Monetary Base
+
+### Additional Indicators
+- Initial Jobless Claims
+- Personal Consumption Expenditures
+- Housing Starts
+
+### Series IDs Reference
+For direct data queries using `;getdata`, use these series IDs:
+```
+CPIAUCSL    → Consumer Price Index
+CPILFESL    → Core CPI
+PAYEMS      → Nonfarm Payroll
+UNRATE      → Unemployment Rate
+GDP         → Gross Domestic Product
+FEDFUNDS    → Federal Funds Rate
+INDPRO      → Industrial Production
+RSXFS       → Retail Sales
+RRSFS       → Real Retail Sales
+VIXCLS      → VIX Index
+DTWEXB      → US Dollar Index
+DCOILWTICO  → Crude Oil WTI
+WPU10210301 → Gold Price
+DGS2        → 2Y Treasury Rate
+DGS10       → 10Y Treasury Rate
+T10Y2Y      → 10Y-2Y Spread
+WALCL       → Fed Balance Sheet
+M2V         → M2 Velocity
+BOGMBASE    → Monetary Base
+ICSA        → Initial Claims
+PCE         → Personal Consumption
+HOUST       → Housing Starts
+```
 
 ## ⚙️ Channel Setup
 
