@@ -3,4 +3,4 @@ pytz
 fredapi
 pandas
 finvizfinance
-aiohttp
+python-dotenv
