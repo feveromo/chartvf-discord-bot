@@ -375,7 +375,10 @@ async def get_current_data(ctx, series_id: str):
     try:
         # Get series info and data
         info = fred.get_series_info(series_id)
-        series = fred.get_series(series_id, limit=1)
+        # Retrieve full series to ensure we get the latest observation (fred returns ascending order)
+        series = fred.get_series(series_id)
+        # Drop any trailing NaNs just in case
+        series = series.dropna()
         
         embed = discord.Embed(
             title=f"📊 {info['title']}",
