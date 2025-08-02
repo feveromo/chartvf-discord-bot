@@ -1,6 +1,5 @@
 import discord
 from discord.ext import commands, tasks
-from finvizfinance.quote import finvizfinance
 from datetime import datetime, timedelta
 import pytz
 from fredapi import Fred
@@ -44,7 +43,6 @@ ECONOMIC_INDICATORS = {
     'VIXCLS': 'VIX Volatility Index',
     'DTWEXB': 'US Dollar Index',
     'DCOILWTICO': 'Crude Oil WTI',
-    'WPU10210301': 'Gold Price',
     
     # Interest Rates & Spreads
     'DGS2': '2-Year Treasury Rate',
@@ -89,8 +87,9 @@ async def fetch_economic_events():
     while next_day.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
         next_day += timedelta(days=1)
     
-    # Set release time to 8:30 AM ET for next business day
-    next_release = next_day.replace(hour=8, minute=30, second=0, microsecond=0)
+    # FRED does not provide reliable intra-day release times.
+    # Use the calendar date only (midnight) to avoid showing incorrect times.
+    release_date = next_day.date()
     
     try:
         for series_id, description in ECONOMIC_INDICATORS.items():
@@ -124,7 +123,7 @@ async def fetch_economic_events():
                         formatted_value = f"{previous_value:.2f}%"
                     elif series_id == 'DCOILWTICO':  # Oil price
                         formatted_value = f"${previous_value:.2f}/bbl"
-                    elif series_id == 'WPU10210301':  # Gold price
+                    elif series_id == 'GOLDPMGBD228NLBM':  # Gold price
                         formatted_value = f"${previous_value:.2f}/oz"
                     elif 'Billions of Dollars' in info.get('units', ''):
                         formatted_value = f"${previous_value:,.2f}B"
@@ -140,7 +139,7 @@ async def fetch_economic_events():
                     formatted_value = 'N/A'
                 
                 events.append({
-                    'time': next_release.isoformat(),
+                    'time': release_date.isoformat(),
                     'title': f"{description}",
                     'series_id': series_id,
                     'impact': 'High' if series_id in ['CPIAUCSL', 'PAYEMS', 'GDP', 'FEDFUNDS'] else 'Medium',
@@ -161,7 +160,11 @@ async def check_events():
     now = datetime.now(pytz.UTC)
     
     for event in daily_events:
-        event_time = datetime.fromisoformat(event['time'])
+        event_time = datetime.fromisoformat(event['time']).replace(tzinfo=pytz.UTC)
+        # Skip events without a specific intra-day time (midnight placeholder)
+        if event_time.hour == 0 and event_time.minute == 0:
+            continue
+
         time_until_event = event_time - now
         
         if timedelta(minutes=14) <= time_until_event <= timedelta(minutes=15):
@@ -213,8 +216,10 @@ async def on_message(message):
         if len(parts) == 2:
             ticker, timeframe = parts
             await send_chart(message.channel, ticker, timeframe)
+            return
         else:
             await message.channel.send("Invalid command. Use format: ;ticker timeframe (e.g., ;aapl d, ;aapl w, ;aapl m)")
+            return
     
     # Process other commands
     await bot.process_commands(message)
@@ -235,8 +240,10 @@ async def send_chart(channel, ticker: str, timeframe: str):
         return
 
     try:
-        stock = finvizfinance(ticker)
-        chart_url = stock.ticker_charts(timeframe=valid_timeframes[timeframe])
+        # Build Finviz chart URL directly to avoid saving images locally
+        p_map = {'daily': 'd', 'weekly': 'w', 'monthly': 'm'}
+        p = p_map[valid_timeframes[timeframe]]
+        chart_url = f"https://finviz.com/chart.ashx?t={ticker.upper()}&ty=c&ta=1&p={p}&s=l"
         embed = discord.Embed(title=f"{ticker.upper()} {valid_timeframes[timeframe]} Chart", color=0x00ff00)
         embed.set_image(url=chart_url)
         await channel.send(embed=embed)
@@ -303,12 +310,16 @@ async def list_events(ctx):
 
     # Format high impact events
     for event in high_impact_events:
-        event_time = datetime.fromisoformat(event['time'])
-        time_str = event_time.strftime('%I:%M %p')
-        date_str = event_time.strftime('%a, %b %d')  # e.g., "Mon, Nov 16"
+        event_date = datetime.fromisoformat(event['time'])
+        date_str = event_date.strftime('%a, %b %d')  # e.g., "Mon, Nov 16"
+        if event_date.hour or event_date.minute:
+            time_str = event_date.strftime('%I:%M %p')
+            name_field = f"{date_str} • {time_str}"
+        else:
+            name_field = date_str
         
         high_impact_embed.add_field(
-            name=f"{date_str} • {time_str}",
+            name=name_field,
             value=f"**{event['title']}**\n└ Previous: {event['previous']}",
             inline=False
         )
@@ -324,9 +335,13 @@ async def list_events(ctx):
     current_text = ""
     
     for event in other_events:
-        event_time = datetime.fromisoformat(event['time'])
-        date_str = event_time.strftime('%a, %b %d')
-        time_str = event_time.strftime('%I:%M %p')
+        event_date = datetime.fromisoformat(event['time'])
+        date_str = event_date.strftime('%a, %b %d')
+        if event_date.hour or event_date.minute:
+            time_str = event_date.strftime('%I:%M %p')
+            time_component = f"`{time_str}` "
+        else:
+            time_component = ""
         
         if date_str != current_date:
             if current_text:
@@ -334,7 +349,7 @@ async def list_events(ctx):
                 current_text = ""
             current_date = date_str
             
-        current_text += f"`{time_str}` **{event['title']}** ({event['previous']})\n"
+        current_text += f"{time_component}**{event['title']}** ({event['previous']})\n"
     
     if current_text:
         other_embed.add_field(name=current_date, value=current_text, inline=False)
