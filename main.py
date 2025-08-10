@@ -6,6 +6,9 @@ from fredapi import Fred
 import pandas as pd
 import os
 from dotenv import load_dotenv
+import aiohttp
+import io
+import time
 
 # Load environment variables
 load_dotenv()
@@ -225,30 +228,55 @@ async def on_message(message):
     await bot.process_commands(message)
 
 async def send_chart(channel, ticker: str, timeframe: str):
-    """Original chart functionality"""
+    """Fetch and send a fresh Finviz chart as an attachment to bypass Discord caching."""
     timeframe = timeframe.lower()
     valid_timeframes = {
         'd': 'daily', 'w': 'weekly', 'm': 'monthly'
     }
-    
+
     if timeframe in ['3', '5', '15']:
         await channel.send("Intraday charts are only available for FINVIZ*Elite users.")
         return
-    
+
     if timeframe not in valid_timeframes:
         await channel.send("Invalid timeframe. Use 'd' for daily, 'w' for weekly, or 'm' for monthly.")
         return
 
+    # Build Finviz chart URL
+    p_map = {'daily': 'd', 'weekly': 'w', 'monthly': 'm'}
+    p = p_map[valid_timeframes[timeframe]]
+    upper_ticker = ticker.upper()
+    chart_url = f"https://finviz.com/chart.ashx?t={upper_ticker}&ty=c&ta=1&p={p}&s=l"
+
+    # Try downloading the image and uploading it as an attachment (prevents Discord CDN caching)
     try:
-        # Build Finviz chart URL directly to avoid saving images locally
-        p_map = {'daily': 'd', 'weekly': 'w', 'monthly': 'm'}
-        p = p_map[valid_timeframes[timeframe]]
-        chart_url = f"https://finviz.com/chart.ashx?t={ticker.upper()}&ty=c&ta=1&p={p}&s=l"
-        embed = discord.Embed(title=f"{ticker.upper()} {valid_timeframes[timeframe]} Chart", color=0x00ff00)
-        embed.set_image(url=chart_url)
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+                "Referer": f"https://finviz.com/quote.ashx?t={upper_ticker}&p={p}",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            }
+            async with session.get(chart_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    image_bytes = await resp.read()
+                    file_name = f"{upper_ticker}_{p}_{int(time.time())}.png"
+                    file = discord.File(io.BytesIO(image_bytes), filename=file_name)
+
+                    embed = discord.Embed(title=f"{upper_ticker} {valid_timeframes[timeframe]} Chart", color=0x00ff00)
+                    embed.set_image(url=f"attachment://{file_name}")
+                    await channel.send(embed=embed, file=file)
+                    return
+                else:
+                    # Fall back to embedding the URL with a cache-busting param
+                    raise RuntimeError(f"HTTP {resp.status}")
+    except Exception:
+        # Fallback: Use the direct URL with a timestamp to bust Discord cache
+        cache_bust_url = f"{chart_url}&rand={int(time.time())}"
+        embed = discord.Embed(title=f"{upper_ticker} {valid_timeframes[timeframe]} Chart", color=0x00ff00)
+        embed.set_image(url=cache_bust_url)
         await channel.send(embed=embed)
-    except Exception as e:
-        await channel.send(f"An error occurred: {str(e)}")
 
 @bot.command(name='setchannel')
 @commands.has_permissions(administrator=True)

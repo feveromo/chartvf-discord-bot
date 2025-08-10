@@ -4,3 +4,4 @@ fredapi
 pandas
 finvizfinance
 python-dotenv
+aiohttp
