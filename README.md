@@ -14,6 +14,17 @@ python main.py
 
 Enable **Message Content Intent** for the bot in the Discord Developer Portal.
 
+## Railway
+
+1. Push this repo to GitHub.
+2. In Railway, create a new project from the GitHub repo.
+3. Add a Railway variable named `DISCORD_TOKEN` with your Discord bot token.
+4. Confirm **Message Content Intent** is enabled for the bot in the Discord Developer Portal.
+5. Deploy the service. The repo's `railway.toml` sets the start command to `python main.py`.
+
+This bot is a long-running Discord worker, not an HTTP web service, so it does not need a
+`PORT` binding or Railway healthcheck path.
+
 ## Commands
 
 ```text
@@ -36,13 +47,13 @@ Enable **Message Content Intent** for the bot in the Discord Developer Portal.
 
 Options can be in any order after the ticker.
 
-Timeframes: `d`, `w`, `m`. Futures also support `1`, `5`, `15`, `30`, `60`, `2h`, `4h`.
+Timeframes: stocks support `d`, `w`, `m`. Futures also support `1`, `5`, `15`, `30`, `60`, `2h`, `4h`.
 Chart types: `candle`, `line`.
 Ranges: `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`.
 Themes: `dark`, `light`.
 Scales: `linear`, `log`, `percent`.
 
-Stock intraday image params are not included because Finviz silently downgrades them to daily charts. Futures intraday works through the quote API. Discord also caps inline image previews, so there is no `big` mode.
+Stock intraday is not available from Finviz's public stock chart endpoints: the quote API returns 404 and the image renderer returns `Chart not available`. Futures intraday works through the quote API because it exposes OHLC bars the bot can render locally. Discord also caps inline image previews, so there is no `big` mode.
 
 ## Futures
 

@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 PREFIX = ";"
 DEFAULT_TIMEFRAME = "d"
@@ -17,6 +18,7 @@ DEFAULT_SCALE = "linear"
 DEFAULT_SCALE_FACTOR = 2
 DEFAULT_WIDTH = 466
 DEFAULT_HEIGHT = 219
+MARKET_TIME_ZONE = ZoneInfo("America/New_York")
 CHART_IMAGE_MIN_BYTES = 10_000
 
 TIMEFRAMES = {
@@ -82,6 +84,12 @@ DATE_RANGES = {
 }
 INTRADAY_ALIASES = set(FUTURES_TIMEFRAMES)
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,14}$")
+STOCK_INTRADAY_UNAVAILABLE_MESSAGE = (
+    "Stock intraday is not available from Finviz's public stock chart endpoints: "
+    "the quote API returns 404 and the image renderer returns `Chart not available`. "
+    "Futures intraday works because Finviz exposes futures OHLC data for the bot to render locally. "
+    "Use `d`, `w`, or `m` for stocks, or try futures like `;fut ES 15`."
+)
 
 # Futures must not use `;f`: that is Ford's stock ticker. Use `;fut ES`.
 FUTURES_TICKER_RE = re.compile(r"^[A-Z0-9]{1,8}$")
@@ -157,7 +165,7 @@ def parse_chart_command(content: str) -> ChartRequest | None:
         elif option in DATE_RANGES:
             date_range, date_range_label = DATE_RANGES[option]
         elif option in INTRADAY_ALIASES:
-            raise ValueError("Stock image charts here support `d`, `w`, and `m` only. Futures can use intraday, e.g. `;fut ES 15`.")
+            raise ValueError(STOCK_INTRADAY_UNAVAILABLE_MESSAGE)
         else:
             raise ValueError(
                 f"Unknown chart option `{raw_option}`. Use `d`, `w`, `m`, `candle`, `line`, `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`, `dark`, `light`, `linear`, `log`, or `percent`. Futures also support `1`, `5`, `15`, `30`, `60`, `2h`, and `4h`."
@@ -507,9 +515,28 @@ def _fmt_volume(value: Any) -> str:
     return f"{number:,.0f}"
 
 
-def futures_quote_description(quote: dict[str, Any]) -> str:
-    name = quote.get("name") or "futures"
-    return f"{name} · last `{_fmt(quote.get('lastClose'))}` · change `{_fmt(quote.get('perfDayUsd'))}` (`{_fmt(quote.get('perfDayPct'), '%')}`)"
+def _quote_time_label(quote: dict[str, Any]) -> str | None:
+    timestamp = _safe_float(quote.get("lastTime"))
+    if timestamp is None:
+        dates = quote.get("date") or []
+        timestamp = _safe_float(dates[-1]) if dates else None
+    if timestamp is None:
+        return None
+    stamp = dt.datetime.fromtimestamp(timestamp, dt.timezone.utc).astimezone(MARKET_TIME_ZONE)
+    return stamp.strftime("%I:%M %p ET").lstrip("0")
+
+
+def quote_description(quote: dict[str, Any]) -> str:
+    name = quote.get("name") or quote.get("ticker") or "quote"
+    parts = [
+        str(name),
+        f"last `{_fmt(quote.get('lastClose'))}`",
+        f"change `{_fmt(quote.get('perfDayUsd'))}` (`{_fmt(quote.get('perfDayPct'), '%')}`)",
+    ]
+    time_label = _quote_time_label(quote)
+    if time_label:
+        parts.append(f"updated `{time_label}`")
+    return " · ".join(parts)
 
 
 def _self_test() -> None:
@@ -530,10 +557,13 @@ def _self_test() -> None:
     ranged_url = finviz_chart_url(ranged)
     assert "r=y1" in ranged_url
     assert "chart.ashx" in legacy_finviz_chart_url(ChartRequest("AAPL"))
+    assert "updated `10:50 AM ET`" in quote_description({"ticker": "AMD", "lastClose": 548.54, "lastTime": 1781535058})
     try:
         parse_chart_command(";spy 5")
     except ValueError as error:
-        assert "Futures can use intraday" in str(error)
+        assert "quote API returns 404" in str(error)
+        assert "Chart not available" in str(error)
+        assert "Futures intraday works" in str(error)
     else:
         raise AssertionError("stock intraday alias should be rejected")
 
@@ -591,7 +621,7 @@ HELP_TEXT = """**Finviz chart bot**
 `;futures GC 1y` → gold 1-year chart
 
 **Options** (same for stocks and futures)
-Timeframes: `d`, `w`, `m`; futures also support `1`, `5`, `15`, `30`, `60`, `2h`, `4h`
+Timeframes: stocks support `d`, `w`, `m`; futures also support `1`, `5`, `15`, `30`, `60`, `2h`, `4h`
 Types: `candle`, `line`
 Ranges: `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`
 Themes: `dark`, `light`
@@ -602,6 +632,10 @@ Options can be in any order after the ticker.
 **Futures** (`;fut`/`;future`/`;futures`): `;f` is still Ford (`F`). Futures are
 rendered from Finviz's futures quote API, so roots like `ES`, `NQ`, `GC`, `CL`,
 `6E`, and `VX` work even when Finviz's stock image endpoint would collide.
+
+**Stock intraday**: Finviz's public stock quote API returns 404 for intraday
+timeframes, and the stock image renderer returns `Chart not available`. Futures
+intraday works because the futures quote API exposes OHLC bars the bot can draw.
 """
 
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=12)
@@ -670,7 +704,7 @@ async def fetch_chart_image(session: aiohttp.ClientSession, request: ChartReques
 
 
 async def send_chart(channel: discord.abc.Messageable, request: ChartRequest) -> None:
-    direct_url = finviz_chart_url(request)
+    direct_url = finviz_chart_url(request, cache_bust=True)
     legacy_url = legacy_finviz_chart_url(request)
     headers = {
         "User-Agent": USER_AGENT,
@@ -689,20 +723,21 @@ async def send_chart(channel: discord.abc.Messageable, request: ChartRequest) ->
                 if request.futures:
                     quote = await fetch_quote_data(session, request)
                     image = render_futures_chart_png(quote, request)
-                    description = futures_quote_description(quote)
+                    description = quote_description(quote)
                 else:
                     try:
-                        await fetch_quote_data(session, request)
+                        quote = await fetch_quote_data(session, request)
+                        description = quote_description(quote)
                     except NoChartData:
                         raise
-                    except Exception:
+                    except (aiohttp.ClientError, RuntimeError, TimeoutError, ValueError):
                         pass  # precheck is best-effort; the image fetch still proves the chart.
 
                     try:
                         image = await fetch_chart_image(session, request, direct_url)
                     except NoChartData:
                         raise
-                    except Exception:
+                    except (aiohttp.ClientError, RuntimeError, TimeoutError):
                         image = await fetch_chart_image(session, request, legacy_url)
         except NoChartData as error:
             await channel.send(str(error))

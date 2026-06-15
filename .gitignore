@@ -1,7 +1,11 @@
 .env
+.env.*
+!.env.example
 .venv/
+.railway/
 .pi/
 .claude
+.omo
 AGENTS.md
 __pycache__/
 *.pyc
