@@ -83,12 +83,19 @@ DATE_RANGES = {
     "all": ("max", "max"),
 }
 INTRADAY_ALIASES = set(FUTURES_TIMEFRAMES)
+STOCK_INTRADAY_INTERVALS = {
+    "i1": "1m",
+    "i2": "2m",
+    "i5": "5m",
+    "i15": "15m",
+    "i30": "30m",
+    "h": "60m",
+    "h4": "4h",
+}
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,14}$")
-STOCK_INTRADAY_UNAVAILABLE_MESSAGE = (
-    "Stock intraday is not available from Finviz's public stock chart endpoints: "
-    "the quote API returns 404 and the image renderer returns `Chart not available`. "
-    "Futures intraday works because Finviz exposes futures OHLC data for the bot to render locally. "
-    "Use `d`, `w`, or `m` for stocks, or try futures like `;fut ES 15`."
+STOCK_INTRADAY_UNSUPPORTED_MESSAGE = (
+    "Stock intraday supports `1`, `2`, `5`, `15`, `30`, `60`, and `4h` "
+    "via Yahoo chart data. Use `d`, `w`, or `m` for Finviz stock charts."
 )
 
 # Futures must not use `;f`: that is Ford's stock ticker. Use `;fut ES`.
@@ -154,8 +161,12 @@ def parse_chart_command(content: str) -> ChartRequest | None:
         option = raw_option.lower()
         if option in TIMEFRAMES:
             timeframe, timeframe_label = TIMEFRAMES[option]
-        elif is_futures and option in FUTURES_TIMEFRAMES:
-            timeframe, timeframe_label = FUTURES_TIMEFRAMES[option]
+        elif option in FUTURES_TIMEFRAMES:
+            candidate_timeframe, candidate_label = FUTURES_TIMEFRAMES[option]
+            if is_futures or candidate_timeframe in STOCK_INTRADAY_INTERVALS:
+                timeframe, timeframe_label = candidate_timeframe, candidate_label
+            else:
+                raise ValueError(STOCK_INTRADAY_UNSUPPORTED_MESSAGE)
         elif option in CHART_TYPES:
             chart_type, chart_type_label = CHART_TYPES[option]
         elif option in THEMES:
@@ -165,10 +176,10 @@ def parse_chart_command(content: str) -> ChartRequest | None:
         elif option in DATE_RANGES:
             date_range, date_range_label = DATE_RANGES[option]
         elif option in INTRADAY_ALIASES:
-            raise ValueError(STOCK_INTRADAY_UNAVAILABLE_MESSAGE)
+            raise ValueError(STOCK_INTRADAY_UNSUPPORTED_MESSAGE)
         else:
             raise ValueError(
-                f"Unknown chart option `{raw_option}`. Use `d`, `w`, `m`, `candle`, `line`, `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`, `dark`, `light`, `linear`, `log`, or `percent`. Futures also support `1`, `5`, `15`, `30`, `60`, `2h`, and `4h`."
+                f"Unknown chart option `{raw_option}`. Use `d`, `w`, `m`, stock intraday `1`, `2`, `5`, `15`, `30`, `60`, `4h`, `candle`, `line`, `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`, `dark`, `light`, `linear`, `log`, or `percent`. Futures also support `3`, `10`, and `2h`."
             )
 
     return ChartRequest(
@@ -239,6 +250,19 @@ def finviz_quote_api_url(request: ChartRequest) -> str:
         "rev": str(int(time.time() * 1000)),
     }
     return "https://finviz.com/api/quote?" + urlencode(params)
+
+
+def yahoo_stock_chart_url(request: ChartRequest) -> str:
+    params = {
+        "range": "1d",
+        "interval": STOCK_INTRADAY_INTERVALS[request.timeframe],
+        "includePrePost": "false",
+    }
+    return f"https://query1.finance.yahoo.com/v8/finance/chart/{request.ticker}?" + urlencode(params)
+
+
+def is_stock_intraday(request: ChartRequest) -> bool:
+    return not request.futures and request.timeframe in STOCK_INTRADAY_INTERVALS
 
 
 def chart_title(request: ChartRequest) -> str:
@@ -330,7 +354,8 @@ def _axis_label(value: float, request: ChartRequest) -> str:
 def _date_label(epoch: int, intraday: bool, span: int) -> str:
     stamp = dt.datetime.fromtimestamp(epoch, dt.timezone.utc)
     if intraday:
-        return stamp.strftime("%H:%M") if span <= 3 * 86400 else stamp.strftime("%m/%d")
+        local = stamp.astimezone(MARKET_TIME_ZONE)
+        return local.strftime("%H:%M") if span <= 3 * 86400 else local.strftime("%m/%d")
     return stamp.strftime("%b") if span < 400 * 86400 else stamp.strftime("%y")
 
 
@@ -558,14 +583,18 @@ def _self_test() -> None:
     assert "r=y1" in ranged_url
     assert "chart.ashx" in legacy_finviz_chart_url(ChartRequest("AAPL"))
     assert "updated `10:50 AM ET`" in quote_description({"ticker": "AMD", "lastClose": 548.54, "lastTime": 1781535058})
+    assert parse_chart_command(";amd 1") == ChartRequest("AMD", "i1", "1 min")
+    assert parse_chart_command(";amd 4h") == ChartRequest("AMD", "h4", "4 hour")
+    assert "interval=1m" in yahoo_stock_chart_url(ChartRequest("AMD", "i1", "1 min"))
+    assert is_stock_intraday(ChartRequest("AMD", "i1", "1 min"))
+    assert _date_label(1781536808, True, 3600) == "11:20"
     try:
-        parse_chart_command(";spy 5")
+        parse_chart_command(";spy 10")
     except ValueError as error:
-        assert "quote API returns 404" in str(error)
-        assert "Chart not available" in str(error)
-        assert "Futures intraday works" in str(error)
+        assert "Stock intraday supports" in str(error)
+        assert "Yahoo chart data" in str(error)
     else:
-        raise AssertionError("stock intraday alias should be rejected")
+        raise AssertionError("unsupported stock intraday alias should be rejected")
 
     # Futures: use `;fut`, not `;f` — `;f` is Ford.
     assert parse_chart_command(";f") == ChartRequest("F")
@@ -612,6 +641,7 @@ HELP_TEXT = """**Finviz chart bot**
 
 **Examples**
 `;AAPL` → daily candle chart
+`;AMD 1` → AMD 1-minute intraday chart
 `;QQQ w line` → weekly line chart
 `;LULU 1y` → 1-year chart
 `;AAPL light log` → light theme, log scale
@@ -621,7 +651,7 @@ HELP_TEXT = """**Finviz chart bot**
 `;futures GC 1y` → gold 1-year chart
 
 **Options** (same for stocks and futures)
-Timeframes: stocks support `d`, `w`, `m`; futures also support `1`, `5`, `15`, `30`, `60`, `2h`, `4h`
+Timeframes: stocks support `d`, `w`, `m`, plus intraday `1`, `2`, `5`, `15`, `30`, `60`, `4h`; futures also support `3`, `10`, `2h`
 Types: `candle`, `line`
 Ranges: `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`
 Themes: `dark`, `light`
@@ -633,9 +663,8 @@ Options can be in any order after the ticker.
 rendered from Finviz's futures quote API, so roots like `ES`, `NQ`, `GC`, `CL`,
 `6E`, and `VX` work even when Finviz's stock image endpoint would collide.
 
-**Stock intraday**: Finviz's public stock quote API returns 404 for intraday
-timeframes, and the stock image renderer returns `Chart not available`. Futures
-intraday works because the futures quote API exposes OHLC bars the bot can draw.
+**Stock intraday**: Finviz's public stock endpoints do not expose usable
+intraday charts, so stock intraday is rendered from Yahoo chart data.
 """
 
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=12)
@@ -690,6 +719,49 @@ async def fetch_quote_data(session: aiohttp.ClientSession, request: ChartRequest
     return data
 
 
+async def fetch_stock_intraday_data(session: aiohttp.ClientSession, request: ChartRequest) -> dict[str, Any]:
+    async with session.get(yahoo_stock_chart_url(request), headers={"Accept": "application/json"}) as response:
+        if response.status == 404:
+            raise NoChartData(f"Yahoo has no intraday chart data for `{request.ticker}`.")
+        if response.status != 200:
+            raise RuntimeError(f"Yahoo intraday check returned HTTP {response.status}")
+        data = await response.json(content_type=None)
+
+    chart = data.get("chart") or {}
+    if chart.get("error"):
+        raise NoChartData(f"Yahoo has no intraday chart data for `{request.ticker}`.")
+    results = chart.get("result") or []
+    if not results:
+        raise NoChartData(f"Yahoo has no intraday chart data for `{request.ticker}`.")
+
+    result = results[0]
+    meta = result.get("meta") or {}
+    quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    dates = result.get("timestamp") or []
+    closes = quote.get("close") or []
+    last = _safe_float(meta.get("regularMarketPrice")) or next(
+        (_safe_float(value) for value in reversed(closes) if _safe_float(value) is not None),
+        None,
+    )
+    prev = _safe_float(meta.get("chartPreviousClose")) or _safe_float(meta.get("previousClose"))
+    change = (last - prev) if last is not None and prev else None
+    return {
+        "ticker": request.ticker,
+        "name": meta.get("shortName") or meta.get("symbol") or request.ticker,
+        "date": dates,
+        "open": quote.get("open") or [],
+        "high": quote.get("high") or [],
+        "low": quote.get("low") or [],
+        "close": closes,
+        "volume": quote.get("volume") or [],
+        "lastClose": last,
+        "lastTime": meta.get("regularMarketTime") or (dates[-1] if dates else None),
+        "prevClose": prev,
+        "perfDayUsd": change,
+        "perfDayPct": (change / prev * 100) if change is not None and prev else None,
+    }
+
+
 async def fetch_chart_image(session: aiohttp.ClientSession, request: ChartRequest, url: str) -> bytes:
     async with session.get(url, headers={"Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"}) as response:
         if response.status != 200:
@@ -722,6 +794,10 @@ async def send_chart(channel: discord.abc.Messageable, request: ChartRequest) ->
             async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT, headers=headers) as session:
                 if request.futures:
                     quote = await fetch_quote_data(session, request)
+                    image = render_futures_chart_png(quote, request)
+                    description = quote_description(quote)
+                elif is_stock_intraday(request):
+                    quote = await fetch_stock_intraday_data(session, request)
                     image = render_futures_chart_png(quote, request)
                     description = quote_description(quote)
                 else:

@@ -32,6 +32,7 @@ This bot is a long-running Discord worker, not an HTTP web service, so it does n
 ;fut ROOT [timeframe] [type] [range] [theme] [scale]    futures
 
 ;AAPL                daily candle chart
+;AMD 1               AMD 1-minute intraday chart
 ;AAPL w              weekly candle chart
 ;AAPL m line         monthly line chart
 ;AAPL light log      light theme, log scale
@@ -47,13 +48,13 @@ This bot is a long-running Discord worker, not an HTTP web service, so it does n
 
 Options can be in any order after the ticker.
 
-Timeframes: stocks support `d`, `w`, `m`. Futures also support `1`, `5`, `15`, `30`, `60`, `2h`, `4h`.
+Timeframes: stocks support `d`, `w`, `m`, plus intraday `1`, `2`, `5`, `15`, `30`, `60`, `4h`. Futures also support `3`, `10`, `2h`.
 Chart types: `candle`, `line`.
 Ranges: `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`.
 Themes: `dark`, `light`.
 Scales: `linear`, `log`, `percent`.
 
-Stock intraday is not available from Finviz's public stock chart endpoints: the quote API returns 404 and the image renderer returns `Chart not available`. Futures intraday works through the quote API because it exposes OHLC bars the bot can render locally. Discord also caps inline image previews, so there is no `big` mode.
+Stock intraday is rendered from Yahoo chart data because Finviz's public stock chart endpoints do not expose usable intraday charts. Futures intraday still uses Finviz's futures quote API. Discord also caps inline image previews, so there is no `big` mode.
 
 ## Futures
 
