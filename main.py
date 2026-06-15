@@ -95,7 +95,15 @@ STOCK_INTRADAY_INTERVALS = {
     "h": "60m",
     "h4": "4h",
 }
-STOCK_INTRADAY_RANGE = "5d"
+STOCK_INTRADAY_RANGES = {
+    "i1": "5d",
+    "i2": "5d",
+    "i5": "5d",
+    "i15": "5d",
+    "i30": "1mo",
+    "h": "1mo",
+    "h4": "6mo",
+}
 STOCK_YAHOO_INTERVALS = STOCK_INTRADAY_INTERVALS | {"d": "1d"}
 STOCK_DAILY_RANGES = {
     "": "6mo",
@@ -279,9 +287,10 @@ def finviz_quote_api_url(request: ChartRequest) -> str:
 def yahoo_stock_chart_url(request: ChartRequest) -> str:
     if request.timeframe not in STOCK_YAHOO_INTERVALS:
         raise ValueError(f"Yahoo chart data does not support `{request.timeframe_label}` stock charts.")
-    chart_range = STOCK_INTRADAY_RANGE
     if request.timeframe == "d":
         chart_range = STOCK_DAILY_RANGES.get(request.date_range, "6mo")
+    else:
+        chart_range = STOCK_INTRADAY_RANGES[request.timeframe]
     params = {
         "range": chart_range,
         "interval": STOCK_YAHOO_INTERVALS[request.timeframe],
@@ -639,6 +648,8 @@ def _self_test() -> None:
     assert "interval=1m" in yahoo_stock_chart_url(ChartRequest("AMD", "i1", "1 min"))
     assert "range=5d" in yahoo_stock_chart_url(ChartRequest("AMD", "i5", "5 min"))
     assert "interval=5m" in yahoo_stock_chart_url(ChartRequest("AMD", "i5", "5 min"))
+    assert "range=1mo" in yahoo_stock_chart_url(ChartRequest("AMD", "i30", "30 min"))
+    assert "range=6mo" in yahoo_stock_chart_url(ChartRequest("AMD", "h4", "4 hour"))
     assert is_stock_intraday(ChartRequest("AMD", "i1", "1 min"))
     assert is_stock_yahoo_chart(ChartRequest("AMD", "d", "daily"))
     assert _date_label(1781536808, True, 3600) == "11:20"
