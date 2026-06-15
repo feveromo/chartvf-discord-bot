@@ -23,6 +23,8 @@ DEFAULT_HEIGHT = 219
 CHART_RIGHT_MARGIN = 96
 MARKET_TIME_ZONE = ZoneInfo("America/New_York")
 CHART_IMAGE_MIN_BYTES = 10_000
+STOCK_INTRADAY_VISIBLE_BARS = 180
+FUTURES_INTRADAY_VISIBLE_BARS = 140
 
 TIMEFRAMES = {
     "d": ("d", "daily"),
@@ -367,7 +369,10 @@ def _visible_indexes(rows: list[ChartRow], request: ChartRequest) -> list[int]:
     elif request.date_range == "max":
         indexes = list(range(len(rows)))
     else:
-        count = 180 if request.timeframe.startswith(("i", "h")) else {"d": 90, "w": 104, "m": 120}.get(request.timeframe, 90)
+        if request.timeframe.startswith(("i", "h")):
+            count = FUTURES_INTRADAY_VISIBLE_BARS if request.futures else STOCK_INTRADAY_VISIBLE_BARS
+        else:
+            count = {"d": 90, "w": 104, "m": 120}.get(request.timeframe, 90)
         indexes = list(range(max(0, len(rows) - count), len(rows)))
     if len(indexes) < 2:
         raise NoChartData(f"Too little chart data found for `{request.ticker}`.")
@@ -656,6 +661,9 @@ def _self_test() -> None:
     assert "range=6mo" in yahoo_stock_chart_url(ChartRequest("AMD", "h4", "4 hour"))
     assert is_stock_intraday(ChartRequest("AMD", "i1", "1 min"))
     assert is_stock_yahoo_chart(ChartRequest("AMD", "d", "daily"))
+    sample_rows = [(i, 1.0, 1.0, 1.0, float(i + 1), 1.0) for i in range(200)]
+    assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "i5", "5 min"))) == 180
+    assert len(_visible_indexes(sample_rows, ChartRequest("NQ", "i5", "5 min", futures=True))) == 140
     assert _date_label(1781536808, True, 3600) == "11:20"
     assert 80 <= CHART_RIGHT_MARGIN <= 96
     try:
