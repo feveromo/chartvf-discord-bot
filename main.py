@@ -1,9 +1,12 @@
+import datetime as dt
 import io
+import math
 import os
 import re
 import sys
 import time
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlencode
 
 PREFIX = ";"
@@ -23,6 +26,18 @@ TIMEFRAMES = {
     "weekly": ("w", "weekly"),
     "m": ("m", "monthly"),
     "monthly": ("m", "monthly"),
+}
+FUTURES_TIMEFRAMES = {
+    "1": ("i1", "1 min"), "i1": ("i1", "1 min"), "1min": ("i1", "1 min"),
+    "2": ("i2", "2 min"), "i2": ("i2", "2 min"), "2min": ("i2", "2 min"),
+    "3": ("i3", "3 min"), "i3": ("i3", "3 min"), "3min": ("i3", "3 min"),
+    "5": ("i5", "5 min"), "i5": ("i5", "5 min"), "5min": ("i5", "5 min"),
+    "10": ("i10", "10 min"), "i10": ("i10", "10 min"), "10min": ("i10", "10 min"),
+    "15": ("i15", "15 min"), "i15": ("i15", "15 min"), "15min": ("i15", "15 min"),
+    "30": ("i30", "30 min"), "i30": ("i30", "30 min"), "30min": ("i30", "30 min"),
+    "60": ("h", "hourly"), "h": ("h", "hourly"), "1h": ("h", "hourly"), "hourly": ("h", "hourly"),
+    "2h": ("h2", "2 hour"), "h2": ("h2", "2 hour"),
+    "4h": ("h4", "4 hour"), "h4": ("h4", "4 hour"),
 }
 CHART_TYPES = {
     "c": ("c", "candle"),
@@ -65,8 +80,12 @@ DATE_RANGES = {
     "max": ("max", "max"),
     "all": ("max", "max"),
 }
-INTRADAY_ALIASES = {"1", "2", "3", "5", "10", "15", "30", "60", "h", "hourly"}
+INTRADAY_ALIASES = set(FUTURES_TIMEFRAMES)
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,14}$")
+
+# Futures must not use `;f`: that is Ford's stock ticker. Use `;fut ES`.
+FUTURES_TICKER_RE = re.compile(r"^[A-Z0-9]{1,8}$")
+FUTURES_ALIASES = {"fut", "future", "futures"}
 
 
 @dataclass(frozen=True)
@@ -82,6 +101,7 @@ class ChartRequest:
     scale_label: str = "linear"
     date_range: str = ""
     date_range_label: str = ""
+    futures: bool = False
 
 
 class NoChartData(ValueError):
@@ -98,13 +118,22 @@ def parse_chart_command(content: str) -> ChartRequest | None:
 
     if parts[0].lower() in {"help", "h"}:
         return None
-    if parts[0].lower() in {"chart", "charts"}:
+    is_futures = False
+    if parts[0].lower() in FUTURES_ALIASES:
+        is_futures = True
+        parts = parts[1:]
+        if not parts:
+            raise ValueError("Usage: `;fut ES`, `;fut CL w line`, or `;futures GC 1y`")
+    elif parts[0].lower() in {"chart", "charts"}:
         parts = parts[1:]
         if not parts:
             raise ValueError("Usage: `;AAPL`, `;AAPL w`, or `;AAPL m line light log`")
 
     ticker = parts[0].upper().replace(".", "-")
-    if not TICKER_RE.fullmatch(ticker):
+    if is_futures:
+        if not FUTURES_TICKER_RE.fullmatch(ticker):
+            raise ValueError("Futures root looks wrong. Use roots like `;fut ES`, `;fut CL`, or `;fut 6E`.")
+    elif not TICKER_RE.fullmatch(ticker):
         raise ValueError("Ticker looks wrong. Use letters/numbers only, like `;AAPL` or `;BRK-B`.")
 
     timeframe, timeframe_label = TIMEFRAMES[DEFAULT_TIMEFRAME]
@@ -117,6 +146,8 @@ def parse_chart_command(content: str) -> ChartRequest | None:
         option = raw_option.lower()
         if option in TIMEFRAMES:
             timeframe, timeframe_label = TIMEFRAMES[option]
+        elif is_futures and option in FUTURES_TIMEFRAMES:
+            timeframe, timeframe_label = FUTURES_TIMEFRAMES[option]
         elif option in CHART_TYPES:
             chart_type, chart_type_label = CHART_TYPES[option]
         elif option in THEMES:
@@ -126,15 +157,15 @@ def parse_chart_command(content: str) -> ChartRequest | None:
         elif option in DATE_RANGES:
             date_range, date_range_label = DATE_RANGES[option]
         elif option in INTRADAY_ALIASES:
-            raise ValueError("Finviz free charts here support `d`, `w`, and `m` only. Intraday is silently downgraded by Finviz.")
+            raise ValueError("Stock image charts here support `d`, `w`, and `m` only. Futures can use intraday, e.g. `;fut ES 15`.")
         else:
             raise ValueError(
-                f"Unknown chart option `{raw_option}`. Use `d`, `w`, `m`, `candle`, `line`, `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`, `dark`, `light`, `linear`, `log`, or `percent`."
+                f"Unknown chart option `{raw_option}`. Use `d`, `w`, `m`, `candle`, `line`, `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`, `dark`, `light`, `linear`, `log`, or `percent`. Futures also support `1`, `5`, `15`, `30`, `60`, `2h`, and `4h`."
             )
 
     return ChartRequest(
         ticker, timeframe, timeframe_label, chart_type, chart_type_label,
-        theme, theme_label, scale, scale_label, date_range, date_range_label,
+        theme, theme_label, scale, scale_label, date_range, date_range_label, is_futures,
     )
 
 
@@ -152,7 +183,7 @@ def legacy_finviz_chart_url(request: ChartRequest, cache_bust: bool = False) -> 
 
 
 def finviz_chart_url(request: ChartRequest, cache_bust: bool = False) -> str:
-    # Direct renderer schema observed in /home/fever/Dev/api-re-cases/finviz.com.
+    # Direct renderer schema observed from Finviz's web app.
     params = [
         ("w", str(DEFAULT_WIDTH)),
         ("h", str(DEFAULT_HEIGHT)),
@@ -190,7 +221,7 @@ def finviz_chart_url(request: ChartRequest, cache_bust: bool = False) -> str:
 def finviz_quote_api_url(request: ChartRequest) -> str:
     params = {
         "ticker": request.ticker,
-        "instrument": "stock",
+        "instrument": "futures" if request.futures else "stock",
         "timeframe": request.timeframe,
         "premarket": "0",
         "aftermarket": "0",
@@ -211,7 +242,274 @@ def chart_title(request: ChartRequest) -> str:
         parts.append(request.scale_label)
     if request.theme != DEFAULT_THEME:
         parts.append(request.theme_label)
-    return " ".join(parts) + " chart"
+    return " ".join(parts) + (" futures chart" if request.futures else " chart")
+
+
+ChartRow = tuple[int, float, float, float, float, float]
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+
+def _range_cutoff(last_epoch: int, date_range: str) -> int | None:
+    if date_range in {"", "max"}:
+        return None
+    last = dt.datetime.fromtimestamp(last_epoch, dt.timezone.utc)
+    if date_range == "ytd":
+        return int(dt.datetime(last.year, 1, 1, tzinfo=dt.timezone.utc).timestamp())
+    days = {"m1": 31, "m3": 93, "m6": 186, "y1": 365, "y2": 730, "y5": 1826}.get(date_range)
+    return int((last - dt.timedelta(days=days)).timestamp()) if days else None
+
+
+def _quote_rows(quote: dict[str, Any], request: ChartRequest) -> list[ChartRow]:
+    dates = quote.get("date") or []
+    opens = quote.get("open") or []
+    highs = quote.get("high") or []
+    lows = quote.get("low") or []
+    closes = quote.get("close") or []
+    volumes = quote.get("volume") or []
+    rows: list[ChartRow] = []
+    for i in range(min(map(len, (dates, opens, highs, lows, closes)))):
+        o, h, l, c = (_safe_float(values[i]) for values in (opens, highs, lows, closes))
+        if None in (o, h, l, c):
+            continue
+        v = _safe_float(volumes[i]) if i < len(volumes) else 0.0
+        rows.append((int(dates[i]), o or 0.0, h or 0.0, l or 0.0, c or 0.0, v or 0.0))
+    if not rows:
+        raise NoChartData(f"Finviz has no chart data for `{request.ticker}`.")
+    return rows
+
+
+def _visible_indexes(rows: list[ChartRow], request: ChartRequest) -> list[int]:
+    cutoff = _range_cutoff(rows[-1][0], request.date_range)
+    if cutoff is not None:
+        indexes = [i for i, row in enumerate(rows) if row[0] >= cutoff]
+    elif request.date_range == "max":
+        indexes = list(range(len(rows)))
+    else:
+        count = 180 if request.timeframe.startswith(("i", "h")) else {"d": 90, "w": 104, "m": 120}.get(request.timeframe, 90)
+        indexes = list(range(max(0, len(rows) - count), len(rows)))
+    if len(indexes) < 2:
+        raise NoChartData(f"Finviz has too little chart data for `{request.ticker}`.")
+    return indexes
+
+
+def _sma_values(rows: list[ChartRow], period: int) -> list[float | None]:
+    values: list[float | None] = []
+    total = 0.0
+    for i, row in enumerate(rows):
+        total += row[4]
+        if i >= period:
+            total -= rows[i - period][4]
+        values.append(total / period if i >= period - 1 else None)
+    return values
+
+
+def _axis_label(value: float, request: ChartRequest) -> str:
+    if request.scale == "percentage":
+        return f"{value:.0f}%"
+    if request.scale == "logarithmic":
+        value = math.exp(value)
+    return _fmt(value)
+
+
+def _date_label(epoch: int, intraday: bool, span: int) -> str:
+    stamp = dt.datetime.fromtimestamp(epoch, dt.timezone.utc)
+    if intraday:
+        return stamp.strftime("%H:%M") if span <= 3 * 86400 else stamp.strftime("%m/%d")
+    return stamp.strftime("%b") if span < 400 * 86400 else stamp.strftime("%y")
+
+
+def render_futures_chart_png(quote: dict[str, Any], request: ChartRequest) -> bytes:
+    # Pillow keeps text crisp without pulling in a full charting framework.
+    from PIL import Image, ImageDraw, ImageFont
+
+    width, height = DEFAULT_WIDTH * DEFAULT_SCALE_FACTOR, DEFAULT_HEIGHT * DEFAULT_SCALE_FACTOR
+    dark = request.theme == "dark"
+    bg = (31, 34, 46) if dark else (250, 250, 250)
+    grid = (50, 55, 70) if dark else (214, 218, 226)
+    text = (160, 170, 190) if dark else (100, 108, 122)
+    strong = (176, 186, 206) if dark else (50, 55, 65)
+    up, down = (25, 200, 105), (255, 82, 82)
+    line_color = (55, 160, 245) if dark else (25, 105, 210)
+    vol_up, vol_down = (25, 120, 75), (128, 58, 68)
+    sma_colors = {20: (132, 42, 126), 50: (235, 126, 35), 200: (128, 106, 32)}
+
+    def font(size: int, bold: bool = False) -> Any:
+        name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+        for path in (f"/usr/share/fonts/truetype/dejavu/{name}", name):
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                pass
+        return ImageFont.load_default()
+
+    title_font = font(38, True)
+    header_font = font(18)
+    label_font = font(17, True)
+    axis_font = font(18)
+    small_font = font(14)
+    badge_font = font(19, True)
+    sma_font = font(16, True)
+
+    image = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(image)
+
+    left, right, top, bottom = 60, 120, 34, 30
+    volume_h, gap = 68, 8
+    vol_top, vol_bottom = height - bottom - volume_h, height - bottom
+    price_top, price_bottom = top, vol_top - gap
+    plot_w = width - left - right
+    all_rows = _quote_rows(quote, request)
+    indexes = _visible_indexes(all_rows, request)
+    rows = [all_rows[i] for i in indexes]
+    base = rows[0][4]
+    intraday = request.timeframe.startswith(("i", "h"))
+    span = rows[-1][0] - rows[0][0]
+
+    def scaled(value: float) -> float:
+        if request.scale == "percentage":
+            return ((value / base) - 1.0) * 100.0
+        if request.scale == "logarithmic":
+            if value <= 0:
+                raise NoChartData(f"Finviz has non-positive values for `{request.ticker}`, so log scale won't work.")
+            return math.log(value)
+        return value
+
+    smas = {period: _sma_values(all_rows, period) for period in (20, 50, 200)}
+    candles = [(i, d, scaled(o), scaled(h), scaled(l), scaled(c), v) for i, (d, o, h, l, c, v) in zip(indexes, rows)]
+    scale_values = [value for _, _, o, h, l, c, _ in candles for value in (o, h, l, c)]
+    for values in smas.values():
+        for i in indexes:
+            if values[i] is not None:
+                scale_values.append(scaled(values[i] or 0.0))
+    low, high = min(scale_values), max(scale_values)
+    if high == low:
+        high += 1
+        low -= 1
+    pad = (high - low) * 0.055
+    low, high = low - pad, high + pad
+    vol_max = max((row[5] for row in rows), default=1) or 1
+
+    def x_at(i: int) -> int:
+        return left + round(i * (plot_w - 1) / max(len(candles) - 1, 1))
+
+    def y_at(value: float) -> int:
+        return price_bottom - round((value - low) * (price_bottom - price_top) / (high - low))
+
+    def dashed(x1: int, y1: int, x2: int, y2: int) -> None:
+        if y1 == y2:
+            x = x1
+            while x < x2:
+                draw.line((x, y1, min(x + 8, x2), y2), fill=grid, width=1)
+                x += 14
+        else:
+            y = y1
+            while y < y2:
+                draw.line((x1, y, x2, min(y + 8, y2)), fill=grid, width=1)
+                y += 14
+
+    for step in range(5):
+        value = high - step * (high - low) / 4
+        y = y_at(value)
+        dashed(left, y, width - right, y)
+        draw.text((width - right + 8, y - 11), _axis_label(value, request), fill=text, font=axis_font)
+    for step in range(6):
+        x = left + round(step * plot_w / 5)
+        dashed(x, price_top, x, vol_bottom)
+        idx = round(step * (len(rows) - 1) / 5)
+        label = _date_label(rows[idx][0], intraday, span)
+        label_w = draw.textbbox((0, 0), label, font=axis_font)[2]
+        draw.text((max(0, min(width - right - label_w, x - label_w // 2)), vol_bottom + 6), label, fill=text, font=axis_font)
+    draw.line((left, price_bottom, width - right, price_bottom), fill=grid, width=1)
+
+    candle_w = max(2, min(8, int(plot_w / max(len(candles), 1) * 0.58)))
+    close_points: list[tuple[int, int]] = []
+    for pos, (_, _, o, h, l, c, v) in enumerate(candles):
+        x = x_at(pos)
+        color = up if c >= o else down
+        vh = round((v / vol_max) * (vol_bottom - vol_top))
+        draw.rectangle((x - candle_w // 2, vol_bottom - vh, x + candle_w // 2, vol_bottom), fill=vol_up if c >= o else vol_down)
+        if request.chart_type == "l":
+            close_points.append((x, y_at(c)))
+            continue
+        yo, yh, yl, yc = y_at(o), y_at(h), y_at(l), y_at(c)
+        draw.line((x, yh, x, yl), fill=color, width=1)
+        draw.rectangle((x - candle_w // 2, min(yo, yc), x + candle_w // 2, max(yo, yc)), fill=color)
+    if close_points:
+        draw.line(close_points, fill=line_color, width=2, joint="curve")
+
+    for period, values in smas.items():
+        points = [(x_at(pos), y_at(scaled(values[i] or 0.0))) for pos, i in enumerate(indexes) if values[i] is not None]
+        if len(points) > 1:
+            draw.line(points, fill=sma_colors[period], width=2, joint="curve")
+
+    last_idx = indexes[-1]
+    last = all_rows[last_idx]
+    prev = _safe_float(quote.get("prevClose")) or all_rows[max(0, last_idx - 1)][4]
+    change = (_safe_float(quote.get("perfDayUsd")) if quote.get("perfDayUsd") is not None else last[4] - prev) or 0.0
+    pct = (_safe_float(quote.get("perfDayPct")) if quote.get("perfDayPct") is not None else (change / prev * 100 if prev else 0.0)) or 0.0
+    change_color = up if change >= 0 else down
+    date = dt.datetime.fromtimestamp(last[0], dt.timezone.utc).strftime("%b %d")
+    change_label = f"{change:+.2f} ({pct:+.2f}%)"
+
+    draw.text((8, 2), request.ticker, fill=strong, font=title_font)
+    title_w = draw.textbbox((8, 2), request.ticker, font=title_font)[2]
+    draw.text((title_w + 12, 10), date, fill=text, font=header_font)
+    change_w = draw.textbbox((0, 0), change_label, font=label_font)[2]
+    draw.text((width - right - change_w - 8, 8), change_label, fill=change_color, font=label_font)
+
+    for row, period in enumerate((20, 50, 200)):
+        value = smas[period][last_idx]
+        if value is not None:
+            draw.text((8, 46 + row * 22), f"SMA {period} · {_fmt(value)}", fill=sma_colors[period], font=sma_font)
+
+    label = request.timeframe_label.upper()
+    label_img = Image.new("RGBA", (180, 30), (0, 0, 0, 0))
+    label_draw = ImageDraw.Draw(label_img)
+    label_draw.text((0, 0), label, fill=text + (255,), font=label_font)
+    label_img = label_img.crop(label_img.getbbox() or (0, 0, 1, 1)).rotate(90, expand=True)
+    image.paste(label_img, (20, price_top + (price_bottom - price_top - label_img.height) // 2), label_img)
+
+    last_scaled = scaled(last[4])
+    badge_text = _axis_label(last_scaled, request)
+    badge_w = draw.textbbox((0, 0), badge_text, font=badge_font)[2] + 12
+    bx, by = width - badge_w - 6, max(price_top, min(price_bottom - 27, y_at(last_scaled) - 14))
+    draw.rounded_rectangle((bx, by, bx + badge_w, by + 27), radius=2, fill=(245, 211, 65))
+    draw.text((bx + 6, by + 2), badge_text, fill=(22, 24, 30), font=badge_font)
+    draw.text((8, vol_top + 2), _fmt_volume(vol_max), fill=text, font=axis_font)
+
+    output = io.BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+def _fmt(value: Any, suffix: str = "") -> str:
+    number = _safe_float(value)
+    if number is None:
+        return "n/a"
+    return f"{number:,.2f}{suffix}" if abs(number) < 1000 else f"{number:,.0f}{suffix}"
+
+
+def _fmt_volume(value: Any) -> str:
+    number = _safe_float(value)
+    if number is None:
+        return "n/a"
+    for suffix, scale in (("B", 1_000_000_000), ("M", 1_000_000), ("K", 1_000)):
+        if abs(number) >= scale:
+            return f"{number / scale:.1f}{suffix}"
+    return f"{number:,.0f}"
+
+
+def futures_quote_description(quote: dict[str, Any]) -> str:
+    name = quote.get("name") or "futures"
+    return f"{name} · last `{_fmt(quote.get('lastClose'))}` · change `{_fmt(quote.get('perfDayUsd'))}` (`{_fmt(quote.get('perfDayPct'), '%')}`)"
 
 
 def _self_test() -> None:
@@ -235,9 +533,36 @@ def _self_test() -> None:
     try:
         parse_chart_command(";spy 5")
     except ValueError as error:
-        assert "silently downgraded" in str(error)
+        assert "Futures can use intraday" in str(error)
     else:
-        raise AssertionError("intraday alias should be rejected")
+        raise AssertionError("stock intraday alias should be rejected")
+
+    # Futures: use `;fut`, not `;f` — `;f` is Ford.
+    assert parse_chart_command(";f") == ChartRequest("F")
+    assert parse_chart_command(";fut es") == ChartRequest("ES", futures=True)
+    assert parse_chart_command(";fut cl w line") == ChartRequest(
+        "CL", "w", "weekly", "l", "line", futures=True
+    )
+    assert parse_chart_command(";fut es 15") == ChartRequest("ES", "i15", "15 min", futures=True)
+    fut_req = parse_chart_command(";futures gc 1y")
+    assert fut_req is not None
+    assert fut_req.futures and fut_req.ticker == "GC" and fut_req.date_range == "y1"
+    assert chart_title(ChartRequest("ES", futures=True)).endswith("futures chart")
+    assert "instrument=futures" in finviz_quote_api_url(ChartRequest("ES", futures=True))
+    assert parse_chart_command(";fut 6e") == ChartRequest("6E", futures=True)
+    sample_png = render_futures_chart_png({
+        "ticker": "ES",
+        "name": "S&P 500",
+        "date": [1, 2, 3],
+        "open": [10, 11, 10],
+        "high": [12, 12, 11],
+        "low": [9, 10, 9],
+        "close": [11, 10, 10.5],
+        "volume": [100, 150, 120],
+    }, ChartRequest("ES", futures=True))
+    assert sample_png.startswith(b"\x89PNG") and len(sample_png) > 1000
+    aapl_req = parse_chart_command(";aapl")
+    assert aapl_req is not None and not aapl_req.futures
 
 
 if __name__ == "__main__" and "--self-test" in sys.argv:
@@ -252,24 +577,31 @@ from dotenv import load_dotenv
 HELP_TEXT = """**Finviz chart bot**
 
 **Syntax**
-`;TICKER [timeframe] [type] [range] [size] [theme] [scale]`
+`;TICKER [timeframe] [type] [range] [theme] [scale]` — stocks
+`;fut ROOT [timeframe] [type] [range] [theme] [scale]` — futures
 
 **Examples**
 `;AAPL` → daily candle chart
 `;QQQ w line` → weekly line chart
-`;SERV m` → monthly candle chart
 `;LULU 1y` → 1-year chart
 `;AAPL light log` → light theme, log scale
-`;SPY 5y w percent` → 5-year weekly percent chart
+`;fut ES` → E-mini S&P daily candle
+`;fut ES 15` → E-mini S&P 15-minute chart
+`;fut CL w line` → crude oil weekly line
+`;futures GC 1y` → gold 1-year chart
 
-**Options**
-Timeframes: `d`, `w`, `m`
+**Options** (same for stocks and futures)
+Timeframes: `d`, `w`, `m`; futures also support `1`, `5`, `15`, `30`, `60`, `2h`, `4h`
 Types: `candle`, `line`
 Ranges: `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`
 Themes: `dark`, `light`
 Scales: `linear`, `log`, `percent`
 
 Options can be in any order after the ticker.
+
+**Futures** (`;fut`/`;future`/`;futures`): `;f` is still Ford (`F`). Futures are
+rendered from Finviz's futures quote API, so roots like `ES`, `NQ`, `GC`, `CL`,
+`6E`, and `VX` work even when Finviz's stock image endpoint would collide.
 """
 
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=12)
@@ -312,13 +644,16 @@ async def on_message(message: discord.Message) -> None:
         await send_chart(message.channel, request)
 
 
-async def ensure_chart_data(session: aiohttp.ClientSession, request: ChartRequest) -> None:
+async def fetch_quote_data(session: aiohttp.ClientSession, request: ChartRequest) -> dict[str, Any]:
     async with session.get(finviz_quote_api_url(request), headers={"Accept": "application/json"}) as response:
         if response.status == 404:
             raise NoChartData(f"Finviz has no chart data for `{request.ticker}`.")
         if response.status != 200:
             raise RuntimeError(f"Finviz quote check returned HTTP {response.status}")
-        await response.read()
+        data = await response.json(content_type=None)
+    if not data.get("date"):
+        raise NoChartData(f"Finviz has no chart data for `{request.ticker}`.")
+    return data
 
 
 async def fetch_chart_image(session: aiohttp.ClientSession, request: ChartRequest, url: str) -> bytes:
@@ -329,7 +664,7 @@ async def fetch_chart_image(session: aiohttp.ClientSession, request: ChartReques
     if not image.startswith((b"\x89PNG", b"\xff\xd8", b"GIF")):
         raise RuntimeError("Finviz did not return an image")
     if len(image) < CHART_IMAGE_MIN_BYTES:
-        # ponytail: size floor catches Finviz's valid-PNG empty chart for bad tickers.
+        # Size floor catches Finviz's valid-PNG empty chart for bad stock tickers.
         raise NoChartData(f"Finviz returned an empty chart for `{request.ticker}`.")
     return image
 
@@ -339,31 +674,43 @@ async def send_chart(channel: discord.abc.Messageable, request: ChartRequest) ->
     legacy_url = legacy_finviz_chart_url(request)
     headers = {
         "User-Agent": USER_AGENT,
-        "Referer": f"https://finviz.com/quote.ashx?t={request.ticker}",
+        "Referer": (
+            f"https://finviz.com/futures_charts?t={request.ticker}" if request.futures
+            else f"https://finviz.com/quote.ashx?t={request.ticker}"
+        ),
         "Cache-Control": "no-cache",
         "Cookie": f"chartsTheme={request.theme}",
     }
+    description = None
 
     async with channel.typing():
         try:
             async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT, headers=headers) as session:
-                try:
-                    await ensure_chart_data(session, request)
-                except NoChartData:
-                    raise
-                except Exception:
-                    pass  # precheck is best-effort; the image fetch still proves the chart.
+                if request.futures:
+                    quote = await fetch_quote_data(session, request)
+                    image = render_futures_chart_png(quote, request)
+                    description = futures_quote_description(quote)
+                else:
+                    try:
+                        await fetch_quote_data(session, request)
+                    except NoChartData:
+                        raise
+                    except Exception:
+                        pass  # precheck is best-effort; the image fetch still proves the chart.
 
-                try:
-                    image = await fetch_chart_image(session, request, direct_url)
-                except NoChartData:
-                    raise
-                except Exception:
-                    image = await fetch_chart_image(session, request, legacy_url)
+                    try:
+                        image = await fetch_chart_image(session, request, direct_url)
+                    except NoChartData:
+                        raise
+                    except Exception:
+                        image = await fetch_chart_image(session, request, legacy_url)
         except NoChartData as error:
             await channel.send(str(error))
             return
         except Exception as error:
+            if request.futures:
+                await channel.send(f"Upload failed ({error}).")
+                return
             embed = discord.Embed(
                 title=chart_title(request),
                 color=0x2ECC71,
@@ -376,6 +723,7 @@ async def send_chart(channel: discord.abc.Messageable, request: ChartRequest) ->
     file = discord.File(io.BytesIO(image), filename=filename)
     embed = discord.Embed(
         title=chart_title(request),
+        description=description,
         color=0x2ECC71,
     )
     embed.set_image(url=f"attachment://{filename}")

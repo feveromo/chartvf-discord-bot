@@ -2,5 +2,6 @@
 .venv/
 .pi/
 .claude
+AGENTS.md
 __pycache__/
 *.pyc
