@@ -69,6 +69,6 @@ quote data for them.
 
 ```bash
 python main.py --self-test
-python -m py_compile main.py
-pyright --pythonpath .venv/bin/python main.py  # optional
+python -m py_compile main.py charting.py
+pyright --pythonpath .venv/bin/python main.py charting.py  # optional
 ```
