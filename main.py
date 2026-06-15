@@ -20,7 +20,7 @@ DEFAULT_SCALE = "linear"
 DEFAULT_SCALE_FACTOR = 2
 DEFAULT_WIDTH = 466
 DEFAULT_HEIGHT = 219
-CHART_RIGHT_MARGIN = 88
+CHART_RIGHT_MARGIN = 96
 MARKET_TIME_ZONE = ZoneInfo("America/New_York")
 CHART_IMAGE_MIN_BYTES = 10_000
 
@@ -106,11 +106,11 @@ STOCK_INTRADAY_RANGES = {
 }
 STOCK_YAHOO_INTERVALS = STOCK_INTRADAY_INTERVALS | {"d": "1d"}
 STOCK_DAILY_RANGES = {
-    "": "6mo",
-    "m1": "1mo",
-    "m3": "3mo",
-    "m6": "6mo",
-    "ytd": "ytd",
+    "": "1y",
+    "m1": "1y",
+    "m3": "1y",
+    "m6": "1y",
+    "ytd": "1y",
     "y1": "1y",
     "y2": "2y",
     "y5": "5y",
@@ -414,7 +414,7 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     up, down = (25, 200, 105), (255, 82, 82)
     line_color = (55, 160, 245) if dark else (25, 105, 210)
     vol_up, vol_down = (25, 120, 75), (128, 58, 68)
-    sma_colors = {20: (132, 42, 126), 50: (235, 126, 35), 200: (128, 106, 32)}
+    sma_colors = {20: (132, 42, 126), 50: (235, 126, 35), 200: (162, 136, 45)}
 
     def font(size: int, bold: bool = False) -> Any:
         name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
@@ -646,6 +646,10 @@ def _self_test() -> None:
     assert parse_chart_command(";amd 4h") == ChartRequest("AMD", "h4", "4 hour")
     assert "range=1y" in yahoo_stock_chart_url(ranged) and "interval=1d" in yahoo_stock_chart_url(ranged)
     assert "interval=1m" in yahoo_stock_chart_url(ChartRequest("AMD", "i1", "1 min"))
+    assert all(
+        "range=1y" in yahoo_stock_chart_url(request)
+        for request in (ChartRequest("AMD", "d", "daily"), ChartRequest("AMD", "d", "daily", date_range="m1"))
+    )
     assert "range=5d" in yahoo_stock_chart_url(ChartRequest("AMD", "i5", "5 min"))
     assert "interval=5m" in yahoo_stock_chart_url(ChartRequest("AMD", "i5", "5 min"))
     assert "range=1mo" in yahoo_stock_chart_url(ChartRequest("AMD", "i30", "30 min"))
