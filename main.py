@@ -25,6 +25,9 @@ MARKET_TIME_ZONE = ZoneInfo("America/New_York")
 CHART_IMAGE_MIN_BYTES = 10_000
 STOCK_INTRADAY_VISIBLE_BARS = 180
 FUTURES_INTRADAY_VISIBLE_BARS = 140
+STOCK_5M_START = dt.time(7, 0)
+STOCK_5M_END = dt.time(20, 0)
+SPARSE_CHART_MIN_BARS = 24
 
 TIMEFRAMES = {
     "d": ("d", "daily"),
@@ -296,7 +299,7 @@ def yahoo_stock_chart_url(request: ChartRequest) -> str:
     params = {
         "range": chart_range,
         "interval": STOCK_YAHOO_INTERVALS[request.timeframe],
-        "includePrePost": "false",
+        "includePrePost": "true" if request.timeframe == "i5" else "false",
     }
     return f"https://query1.finance.yahoo.com/v8/finance/chart/{request.ticker}?" + urlencode(params)
 
@@ -362,9 +365,27 @@ def _quote_rows(quote: dict[str, Any], request: ChartRequest) -> list[ChartRow]:
     return rows
 
 
+def _stock_5m_today_indexes(rows: list[ChartRow], request: ChartRequest) -> list[int] | None:
+    if request.futures or request.timeframe != "i5" or request.date_range:
+        return None
+    last_local = dt.datetime.fromtimestamp(rows[-1][0], dt.timezone.utc).astimezone(MARKET_TIME_ZONE)
+    start = dt.datetime.combine(last_local.date(), STOCK_5M_START, MARKET_TIME_ZONE).timestamp()
+    end = dt.datetime.combine(last_local.date(), STOCK_5M_END, MARKET_TIME_ZONE).timestamp()
+    indexes = [i for i, row in enumerate(rows) if start <= row[0] <= end]
+    if len(indexes) >= 2:
+        return indexes
+    same_day = [
+        i for i, row in enumerate(rows)
+        if dt.datetime.fromtimestamp(row[0], dt.timezone.utc).astimezone(MARKET_TIME_ZONE).date() == last_local.date()
+    ]
+    return same_day if len(same_day) >= 2 else None
+
+
 def _visible_indexes(rows: list[ChartRow], request: ChartRequest) -> list[int]:
-    cutoff = _range_cutoff(rows[-1][0], request.date_range)
-    if cutoff is not None:
+    today_indexes = _stock_5m_today_indexes(rows, request)
+    if today_indexes is not None:
+        indexes = today_indexes
+    elif (cutoff := _range_cutoff(rows[-1][0], request.date_range)) is not None:
         indexes = [i for i, row in enumerate(rows) if row[0] >= cutoff]
     elif request.date_range == "max":
         indexes = list(range(len(rows)))
@@ -377,6 +398,14 @@ def _visible_indexes(rows: list[ChartRow], request: ChartRequest) -> list[int]:
     if len(indexes) < 2:
         raise NoChartData(f"Too little chart data found for `{request.ticker}`.")
     return indexes
+
+
+def _chart_x_positions(count: int, left: int, plot_w: int) -> list[int]:
+    if count < SPARSE_CHART_MIN_BARS:
+        step = min(32, plot_w // SPARSE_CHART_MIN_BARS)
+        start = left + plot_w - 1 - step * (count - 1)
+        return [start + step * pos for pos in range(count)]
+    return [left + round(pos * (plot_w - 1) / max(count - 1, 1)) for pos in range(count)]
 
 
 def _sma_values(rows: list[ChartRow], period: int) -> list[float | None]:
@@ -477,8 +506,10 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     low, high = low - pad, high + pad
     vol_max = max((row[5] for row in rows), default=1) or 1
 
+    x_positions = _chart_x_positions(len(candles), left, plot_w)
+
     def x_at(i: int) -> int:
-        return left + round(i * (plot_w - 1) / max(len(candles) - 1, 1))
+        return x_positions[i]
 
     def y_at(value: float) -> int:
         return price_bottom - round((value - low) * (price_bottom - price_top) / (high - low))
@@ -500,11 +531,17 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
         y = y_at(value)
         dashed(left, y, width - right, y)
         draw.text((width - right + 8, y - 11), _axis_label(value, request), fill=text, font=axis_font)
+    drawn_sparse_labels: set[str] = set()
     for step in range(6):
         x = left + round(step * plot_w / 5)
         dashed(x, price_top, x, vol_bottom)
         idx = round(step * (len(rows) - 1) / 5)
         label = _date_label(rows[idx][0], intraday, span)
+        if len(rows) < SPARSE_CHART_MIN_BARS:
+            if label in drawn_sparse_labels:
+                continue
+            drawn_sparse_labels.add(label)
+            x = x_at(idx)
         label_w = draw.textbbox((0, 0), label, font=axis_font)[2]
         draw.text((max(0, min(width - right - label_w, x - label_w // 2)), vol_bottom + 6), label, fill=text, font=axis_font)
     draw.line((left, price_bottom, width - right, price_bottom), fill=grid, width=1)
@@ -657,13 +694,28 @@ def _self_test() -> None:
     )
     assert "range=5d" in yahoo_stock_chart_url(ChartRequest("AMD", "i5", "5 min"))
     assert "interval=5m" in yahoo_stock_chart_url(ChartRequest("AMD", "i5", "5 min"))
+    assert "includePrePost=true" in yahoo_stock_chart_url(ChartRequest("AMD", "i5", "5 min"))
+    assert "includePrePost=false" in yahoo_stock_chart_url(ChartRequest("AMD", "i15", "15 min"))
     assert "range=1mo" in yahoo_stock_chart_url(ChartRequest("AMD", "i30", "30 min"))
     assert "range=6mo" in yahoo_stock_chart_url(ChartRequest("AMD", "h4", "4 hour"))
     assert is_stock_intraday(ChartRequest("AMD", "i1", "1 min"))
     assert is_stock_yahoo_chart(ChartRequest("AMD", "d", "daily"))
     sample_rows = [(i, 1.0, 1.0, 1.0, float(i + 1), 1.0) for i in range(200)]
-    assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "i5", "5 min"))) == 180
+    assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "i15", "15 min"))) == 180
     assert len(_visible_indexes(sample_rows, ChartRequest("NQ", "i5", "5 min", futures=True))) == 140
+    def et_epoch(hour: int, minute: int, day: int = 15) -> int:
+        return int(dt.datetime(2026, 6, day, hour, minute, tzinfo=MARKET_TIME_ZONE).timestamp())
+    today_rows = [
+        (et_epoch(15, 55, 14), 1.0, 1.0, 1.0, 1.0, 1.0),
+        (et_epoch(6, 55), 1.0, 1.0, 1.0, 2.0, 1.0),
+        (et_epoch(7, 0), 1.0, 1.0, 1.0, 3.0, 1.0),
+        (et_epoch(12, 0), 1.0, 1.0, 1.0, 4.0, 1.0),
+        (et_epoch(20, 0), 1.0, 1.0, 1.0, 5.0, 1.0),
+        (et_epoch(20, 5), 1.0, 1.0, 1.0, 6.0, 1.0),
+    ]
+    assert _visible_indexes(today_rows, ChartRequest("AMD", "i5", "5 min")) == [2, 3, 4]
+    sparse_positions = _chart_x_positions(2, 60, 776)
+    assert sparse_positions[0] > 760 and sparse_positions[1] == 835
     assert _date_label(1781536808, True, 3600) == "11:20"
     assert 80 <= CHART_RIGHT_MARGIN <= 96
     try:
