@@ -31,7 +31,8 @@ This bot is a long-running Discord worker, not an HTTP web service, so it does n
 ;TICKER [timeframe] [type] [range] [theme] [scale]      stocks
 ;fut ROOT [timeframe] [type] [range] [theme] [scale]    futures
 
-;AAPL                daily candle chart
+;AAPL                latest 5-minute candle chart
+;AAPL d              daily candle chart
 ;AMD 1               AMD 1-minute intraday chart
 ;AAPL w              weekly candle chart
 ;AAPL m line         monthly line chart
@@ -54,7 +55,7 @@ Ranges: `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`.
 Themes: `dark`, `light`.
 Scales: `linear`, `log`, `percent`.
 
-Stock intraday is rendered from Yahoo chart data because Finviz's public stock chart endpoints do not expose usable intraday charts. Futures intraday still uses Finviz's futures quote API. Discord also caps inline image previews, so there is no `big` mode.
+Bare stock commands default to the latest 5-minute chart. Default, daily, and stock intraday charts are rendered from Yahoo chart data so the candle, price badge, and updated timestamp come from the same fresher feed. Futures intraday still uses Finviz's futures quote API. Discord also caps inline image previews, so there is no `big` mode.
 
 ## Futures
 
