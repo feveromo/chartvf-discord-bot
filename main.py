@@ -27,6 +27,10 @@ STOCK_INTRADAY_VISIBLE_BARS = 180
 FUTURES_INTRADAY_VISIBLE_BARS = 140
 STOCK_5M_START = dt.time(7, 0)
 STOCK_5M_END = dt.time(20, 0)
+REGULAR_SESSION_START = dt.time(9, 30)
+REGULAR_SESSION_END = dt.time(16, 0)
+EXTENDED_WICK_PCT_LIMIT = 0.004
+EXTENDED_WICK_RANGE_MULTIPLE = 8.0
 SPARSE_CHART_MIN_BARS = 24
 
 TIMEFRAMES = {
@@ -400,6 +404,34 @@ def _visible_indexes(rows: list[ChartRow], request: ChartRequest) -> list[int]:
     return indexes
 
 
+def _is_regular_stock_session(epoch: int) -> bool:
+    local_time = dt.datetime.fromtimestamp(epoch, dt.timezone.utc).astimezone(MARKET_TIME_ZONE).time()
+    return REGULAR_SESSION_START <= local_time < REGULAR_SESSION_END
+
+
+def _clean_stock_5m_wicks(rows: list[ChartRow], request: ChartRequest) -> list[ChartRow]:
+    if request.futures or request.timeframe != "i5":
+        return rows
+    regular_ranges = sorted(
+        max(0.0, row[2] - row[3])
+        for row in rows
+        if _is_regular_stock_session(row[0])
+    )
+    typical_range = regular_ranges[len(regular_ranges) // 2] if regular_ranges else 0.0
+    threshold = max(abs(rows[-1][4]) * EXTENDED_WICK_PCT_LIMIT, typical_range * EXTENDED_WICK_RANGE_MULTIPLE, 0.0001)
+    cleaned: list[ChartRow] = []
+    for epoch, open_, high, low, close, volume in rows:
+        body_high = max(open_, close)
+        body_low = min(open_, close)
+        if not _is_regular_stock_session(epoch):
+            if body_low - low > threshold:
+                low = body_low
+            if high - body_high > threshold:
+                high = body_high
+        cleaned.append((epoch, open_, max(high, body_high), min(low, body_low), close, volume))
+    return cleaned
+
+
 def _chart_x_positions(count: int, left: int, plot_w: int) -> list[int]:
     if count < SPARSE_CHART_MIN_BARS:
         step = min(32, plot_w // SPARSE_CHART_MIN_BARS)
@@ -475,7 +507,7 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     vol_top, vol_bottom = height - bottom - volume_h, height - bottom
     price_top, price_bottom = top, vol_top - gap
     plot_w = width - left - right
-    all_rows = _quote_rows(quote, request)
+    all_rows = _clean_stock_5m_wicks(_quote_rows(quote, request), request)
     indexes = _visible_indexes(all_rows, request)
     rows = [all_rows[i] for i in indexes]
     base = rows[0][4]
@@ -714,6 +746,19 @@ def _self_test() -> None:
         (et_epoch(20, 5), 1.0, 1.0, 1.0, 6.0, 1.0),
     ]
     assert _visible_indexes(today_rows, ChartRequest("AMD", "i5", "5 min")) == [2, 3, 4]
+    wick_rows = [
+        (et_epoch(7, 0), 100.0, 101.0, 80.0, 100.5, 1.0),
+        (et_epoch(9, 30), 100.5, 100.8, 100.2, 100.6, 1.0),
+        (et_epoch(9, 35), 100.6, 100.9, 100.3, 100.7, 1.0),
+        (et_epoch(9, 40), 100.7, 101.0, 80.0, 100.8, 1.0),
+        (et_epoch(16, 0), 100.8, 130.0, 100.6, 100.9, 1.0),
+        (et_epoch(17, 0), 100.9, 130.0, 100.7, 101.0, 1.0),
+    ]
+    cleaned = _clean_stock_5m_wicks(wick_rows, ChartRequest("AMD", "i5", "5 min"))
+    assert cleaned[0][3] == 100.0
+    assert cleaned[3][3] == 80.0
+    assert cleaned[4][2] == 100.9
+    assert cleaned[5][2] == 101.0
     sparse_positions = _chart_x_positions(2, 60, 776)
     assert sparse_positions[0] > 760 and sparse_positions[1] == 835
     assert _date_label(1781536808, True, 3600) == "11:20"
