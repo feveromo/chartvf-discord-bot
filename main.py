@@ -95,6 +95,7 @@ STOCK_INTRADAY_INTERVALS = {
     "h": "60m",
     "h4": "4h",
 }
+STOCK_INTRADAY_RANGE = "5d"
 STOCK_YAHOO_INTERVALS = STOCK_INTRADAY_INTERVALS | {"d": "1d"}
 STOCK_DAILY_RANGES = {
     "": "6mo",
@@ -278,7 +279,7 @@ def finviz_quote_api_url(request: ChartRequest) -> str:
 def yahoo_stock_chart_url(request: ChartRequest) -> str:
     if request.timeframe not in STOCK_YAHOO_INTERVALS:
         raise ValueError(f"Yahoo chart data does not support `{request.timeframe_label}` stock charts.")
-    chart_range = "1d"
+    chart_range = STOCK_INTRADAY_RANGE
     if request.timeframe == "d":
         chart_range = STOCK_DAILY_RANGES.get(request.date_range, "6mo")
     params = {
@@ -583,6 +584,16 @@ def _quote_time_label(quote: dict[str, Any]) -> str | None:
     return stamp.strftime("%I:%M %p ET").lstrip("0")
 
 
+def _stock_previous_close(meta: dict[str, Any], valid_closes: list[float], request: ChartRequest) -> float | None:
+    if request.timeframe == "d" and len(valid_closes) > 1:
+        return valid_closes[-2]
+    return (
+        _safe_float(meta.get("previousClose"))
+        or _safe_float(meta.get("chartPreviousClose"))
+        or (valid_closes[-2] if len(valid_closes) > 1 else None)
+    )
+
+
 def quote_description(quote: dict[str, Any]) -> str:
     name = quote.get("name") or quote.get("ticker") or "quote"
     parts = [
@@ -616,10 +627,17 @@ def _self_test() -> None:
     assert "r=y1" in ranged_url
     assert "chart.ashx" in legacy_finviz_chart_url(ChartRequest("AAPL"))
     assert "updated `10:50 AM ET`" in quote_description({"ticker": "AMD", "lastClose": 548.54, "lastTime": 1781535058})
+    assert _stock_previous_close(
+        {"chartPreviousClose": 490.33, "previousClose": 511.57},
+        [490.33, 551.24],
+        ChartRequest("AMD", "i5", "5 min"),
+    ) == 511.57
+    assert _stock_previous_close({}, [488.45, 511.57, 551.24], ChartRequest("AMD", "d", "daily")) == 511.57
     assert parse_chart_command(";amd 1") == ChartRequest("AMD", "i1", "1 min")
     assert parse_chart_command(";amd 4h") == ChartRequest("AMD", "h4", "4 hour")
     assert "range=1y" in yahoo_stock_chart_url(ranged) and "interval=1d" in yahoo_stock_chart_url(ranged)
     assert "interval=1m" in yahoo_stock_chart_url(ChartRequest("AMD", "i1", "1 min"))
+    assert "range=5d" in yahoo_stock_chart_url(ChartRequest("AMD", "i5", "5 min"))
     assert "interval=5m" in yahoo_stock_chart_url(ChartRequest("AMD", "i5", "5 min"))
     assert is_stock_intraday(ChartRequest("AMD", "i1", "1 min"))
     assert is_stock_yahoo_chart(ChartRequest("AMD", "d", "daily"))
@@ -783,12 +801,7 @@ async def fetch_stock_chart_data(session: aiohttp.ClientSession, request: ChartR
         (_safe_float(value) for value in reversed(closes) if _safe_float(value) is not None),
         None,
     )
-    if request.timeframe == "d" and len(valid_closes) > 1:
-        prev = valid_closes[-2]
-    else:
-        prev = _safe_float(meta.get("chartPreviousClose")) or _safe_float(meta.get("previousClose"))
-        if prev is None and len(valid_closes) > 1:
-            prev = valid_closes[-2]
+    prev = _stock_previous_close(meta, valid_closes, request)
     change = (last - prev) if last is not None and prev else None
     return {
         "ticker": request.ticker,
