@@ -20,8 +20,8 @@ DEFAULT_WIDTH = 466
 DEFAULT_HEIGHT = 219
 CHART_RIGHT_MARGIN = 80
 MARKET_TIME_ZONE = ZoneInfo("America/New_York")
-CHART_IMAGE_MIN_BYTES = 10_000
 STOCK_DAILY_VISIBLE_BARS = 240
+STOCK_WEEKLY_VISIBLE_BARS = 78
 STOCK_INTRADAY_VISIBLE_BARS = 180
 FUTURES_INTRADAY_VISIBLE_BARS = 140
 STOCK_5M_START = dt.time(7, 0)
@@ -58,10 +58,6 @@ CHART_TYPES = {
     "candles": ("c", "candle"),
     "l": ("l", "line"),
     "line": ("l", "line"),
-}
-DIRECT_CHART_TYPES = {
-    "c": "candle_stick",
-    "l": "line_chart",
 }
 THEMES = {
     "dark": ("dark", "dark"),
@@ -115,7 +111,7 @@ STOCK_INTRADAY_RANGES = {
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,14}$")
 STOCK_INTRADAY_UNSUPPORTED_MESSAGE = (
     "Stock intraday supports `1`, `2`, `5`, `15`, `30`, `60`, and `4h` "
-    "via Yahoo chart data. Use `d`, `w`, or `m` for Finviz stock charts."
+    "via Yahoo chart data. Use `d`, `w`, or `m` for stock quote charts."
 )
 
 # Futures must not use `;f`: that is Ford's stock ticker. Use `;fut ES`.
@@ -216,55 +212,6 @@ def parse_chart_command(content: str) -> ChartRequest | None:
     )
 
 
-def legacy_finviz_chart_url(request: ChartRequest, cache_bust: bool = False) -> str:
-    params = {
-        "t": request.ticker,
-        "ty": request.chart_type,
-        "ta": "1",
-        "p": request.timeframe,
-        "s": "l",
-    }
-    if cache_bust:
-        params["v"] = str(int(time.time()))
-    return "https://finviz.com/chart.ashx?" + urlencode(params)
-
-
-def finviz_chart_url(request: ChartRequest, cache_bust: bool = False) -> str:
-    # Direct renderer schema observed from Finviz's web app.
-    params = [
-        ("w", str(DEFAULT_WIDTH)),
-        ("h", str(DEFAULT_HEIGHT)),
-        ("bw", "2"),
-        ("bm", "1"),
-        ("bb", "1"),
-        ("t", request.ticker),
-        ("tf", request.timeframe),
-        ("s", request.scale),
-        ("pm", "0"),
-        ("am", "0"),
-        ("ct", DIRECT_CHART_TYPES[request.chart_type]),
-        ("o[0][ot]", "sma"),
-        ("o[0][op]", "20"),
-        ("o[0][oc]", "DC32B363"),
-        ("o[1][ot]", "sma"),
-        ("o[1][op]", "50"),
-        ("o[1][oc]", "FF8F33C6"),
-        ("o[2][ot]", "sma"),
-        ("o[2][op]", "200"),
-        ("o[2][oc]", "DCB3326D"),
-        ("o[3][ot]", "patterns"),
-        ("o[3][op]", ""),
-        ("o[3][oc]", "000"),
-        ("sf", str(DEFAULT_SCALE_FACTOR)),
-        ("rev", str(int(time.time()) if cache_bust else int(time.time() // 20))),
-    ]
-    if request.date_range:
-        params.append(("r", request.date_range))
-    if request.theme == "dark":
-        params.append(("tm", "d"))
-    return "https://charts2-node.finviz.com/chart?" + urlencode(params)
-
-
 def finviz_quote_api_url(request: ChartRequest) -> str:
     params = {
         "ticker": request.ticker,
@@ -295,8 +242,8 @@ def is_stock_intraday(request: ChartRequest) -> bool:
     return not request.futures and request.timeframe in STOCK_INTRADAY_INTERVALS
 
 
-def is_stock_daily_quote_chart(request: ChartRequest) -> bool:
-    return not request.futures and request.timeframe == "d"
+def is_stock_quote_chart(request: ChartRequest) -> bool:
+    return not request.futures and request.timeframe in {"d", "w", "m"}
 
 
 def is_stock_yahoo_chart(request: ChartRequest) -> bool:
@@ -385,6 +332,8 @@ def _visible_indexes(rows: list[ChartRow], request: ChartRequest) -> list[int]:
             count = FUTURES_INTRADAY_VISIBLE_BARS if request.futures else STOCK_INTRADAY_VISIBLE_BARS
         elif request.timeframe == "d" and not request.futures:
             count = STOCK_DAILY_VISIBLE_BARS
+        elif request.timeframe == "w" and not request.futures:
+            count = STOCK_WEEKLY_VISIBLE_BARS
         else:
             count = {"d": 90, "w": 104, "m": 120}.get(request.timeframe, 90)
         indexes = list(range(max(0, len(rows) - count), len(rows)))
@@ -486,6 +435,8 @@ def _month_tick_label(epoch: int, span: int) -> str:
     stamp = dt.datetime.fromtimestamp(epoch, dt.timezone.utc)
     if span < 400 * 86400:
         return stamp.strftime("%Y") if stamp.month == 1 else stamp.strftime("%b")
+    if span < 900 * 86400:
+        return stamp.strftime("%y") if stamp.month == 1 else stamp.strftime("%b")[0]
     return stamp.strftime("%y")
 
 
@@ -582,18 +533,28 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     for value in y_ticks:
         y = y_at(value)
         dashed(left, y, width - right, y)
-        draw.text((width - right + 8, y - 11), _axis_label(value, request), fill=text, font=axis_font)
+        if not (request.scale == "linear" and low == 0 and value == 0):
+            draw.text((width - right + 8, y - 11), _axis_label(value, request), fill=text, font=axis_font)
     x_ticks: list[tuple[int, str]]
-    if not intraday and len(rows) >= SPARSE_CHART_MIN_BARS:
+    if request.timeframe == "m" and not intraday:
+        x_ticks = [
+            (pos, dt.datetime.fromtimestamp(row[0], dt.timezone.utc).strftime("%Y"))
+            for pos, row in enumerate(rows)
+            if dt.datetime.fromtimestamp(row[0], dt.timezone.utc).month == 1
+        ]
+    elif not intraday and len(rows) >= SPARSE_CHART_MIN_BARS:
         x_ticks = []
         previous_month: tuple[int, int] | None = None
         for pos, row in enumerate(rows):
             stamp = dt.datetime.fromtimestamp(row[0], dt.timezone.utc)
             month = (stamp.year, stamp.month)
             if month != previous_month:
+                if span >= 400 * 86400 and not x_ticks and stamp.month != 1:
+                    previous_month = month
+                    continue
                 x_ticks.append((pos, _month_tick_label(row[0], span)))
                 previous_month = month
-        if not 4 <= len(x_ticks) <= 18:
+        if not 4 <= len(x_ticks) <= 20:
             x_ticks = []
     else:
         x_ticks = []
@@ -747,12 +708,6 @@ def self_test() -> None:
     ranged = parse_chart_command(";aapl 1y")
     assert ranged is not None
     assert ranged.timeframe == "d" and ranged.date_range == "y1"
-    url = finviz_chart_url(ChartRequest("AAPL"))
-    assert url.startswith("https://charts2-node.finviz.com/chart?")
-    assert "tf=d" in url and "ct=candle_stick" in url and "sf=2" in url and "tm=d" in url
-    ranged_url = finviz_chart_url(ranged)
-    assert "r=y1" in ranged_url
-    assert "chart.ashx" in legacy_finviz_chart_url(ChartRequest("AAPL"))
     assert "updated `10:50 AM ET`" in quote_description({"ticker": "AMD", "lastClose": 548.54, "lastTime": 1781535058})
     assert _stock_previous_close(
         {"chartPreviousClose": 490.33, "previousClose": 511.57},
@@ -770,14 +725,16 @@ def self_test() -> None:
     assert "range=1mo" in yahoo_stock_chart_url(ChartRequest("AMD", "i30", "30 min"))
     assert "range=6mo" in yahoo_stock_chart_url(ChartRequest("AMD", "h4", "4 hour"))
     assert is_stock_intraday(ChartRequest("AMD", "i1", "1 min"))
-    assert is_stock_daily_quote_chart(ChartRequest("AMD", "d", "daily"))
-    assert not is_stock_daily_quote_chart(ChartRequest("ES", "d", "daily", futures=True))
-    assert not is_stock_daily_quote_chart(ChartRequest("AMD", "w", "weekly"))
+    assert is_stock_quote_chart(ChartRequest("AMD", "d", "daily"))
+    assert is_stock_quote_chart(ChartRequest("AMD", "w", "weekly"))
+    assert is_stock_quote_chart(ChartRequest("AMD", "m", "monthly"))
+    assert not is_stock_quote_chart(ChartRequest("ES", "d", "daily", futures=True))
     assert not is_stock_yahoo_chart(ChartRequest("AMD", "d", "daily"))
     sample_rows = [(i, 1.0, 1.0, 1.0, float(i + 1), 1.0) for i in range(200)]
     assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "i15", "15 min"))) == 180
     assert len(_visible_indexes(sample_rows, ChartRequest("NQ", "i5", "5 min", futures=True))) == 140
     assert len(_visible_indexes(sample_rows + sample_rows, ChartRequest("AMD", "d", "daily"))) == STOCK_DAILY_VISIBLE_BARS
+    assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "w", "weekly"))) == STOCK_WEEKLY_VISIBLE_BARS
     assert _nice_linear_axis(14.92, 32.73) == (14, 34, [34, 32, 30, 28, 26, 24, 22, 20, 18, 16, 14])
     def et_epoch(hour: int, minute: int, day: int = 15) -> int:
         return int(dt.datetime(2026, 6, day, hour, minute, tzinfo=MARKET_TIME_ZONE).timestamp())

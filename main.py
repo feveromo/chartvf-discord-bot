@@ -5,18 +5,14 @@ import time
 from typing import Any
 
 from charting import (
-    CHART_IMAGE_MIN_BYTES,
     PREFIX,
     ChartRequest,
     NoChartData,
     _safe_float,
     _stock_previous_close,
     chart_title,
-    finviz_chart_url,
     finviz_quote_api_url,
-    is_stock_daily_quote_chart,
-    is_stock_yahoo_chart,
-    legacy_finviz_chart_url,
+    is_stock_quote_chart,
     parse_chart_command,
     quote_description,
     render_price_chart_png,
@@ -66,9 +62,8 @@ rendered from Finviz's futures quote API, so roots like `ES`, `NQ`, `GC`, `CL`,
 `6E`, and `VX` work even when Finviz's stock image endpoint would collide.
 
 **Stock freshness**: bare stock commands default to the latest 5-minute chart.
-Default and stock intraday charts use Yahoo chart data. Explicit daily stock
-charts are rendered from Finviz quote data so they match Finviz's current daily
-candle.
+Default and stock intraday charts use Yahoo chart data. Explicit daily, weekly,
+and monthly stock charts are rendered from Finviz quote data.
 """
 
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=12)
@@ -167,19 +162,6 @@ async def fetch_stock_chart_data(session: aiohttp.ClientSession, request: ChartR
     }
 
 
-async def fetch_chart_image(session: aiohttp.ClientSession, request: ChartRequest, url: str) -> bytes:
-    async with session.get(url, headers={"Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"}) as response:
-        if response.status != 200:
-            raise RuntimeError(f"Finviz returned HTTP {response.status}")
-        image = await response.read()
-    if not image.startswith((b"\x89PNG", b"\xff\xd8", b"GIF")):
-        raise RuntimeError("Finviz did not return an image")
-    if len(image) < CHART_IMAGE_MIN_BYTES:
-        # Size floor catches Finviz's valid-PNG empty chart for bad stock tickers.
-        raise NoChartData(f"Finviz returned an empty chart for `{request.ticker}`.")
-    return image
-
-
 async def send_chart(channel: discord.abc.Messageable, request: ChartRequest) -> None:
     headers = {
         "User-Agent": USER_AGENT,
@@ -195,48 +177,17 @@ async def send_chart(channel: discord.abc.Messageable, request: ChartRequest) ->
     async with channel.typing():
         try:
             async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT, headers=headers) as session:
-                if request.futures:
+                if request.futures or is_stock_quote_chart(request):
                     quote = await fetch_quote_data(session, request)
-                    image = render_price_chart_png(quote, request)
-                    description = quote_description(quote)
-                elif is_stock_daily_quote_chart(request):
-                    quote = await fetch_quote_data(session, request)
-                    image = render_price_chart_png(quote, request)
-                    description = quote_description(quote)
-                elif is_stock_yahoo_chart(request):
-                    quote = await fetch_stock_chart_data(session, request)
-                    image = render_price_chart_png(quote, request)
-                    description = quote_description(quote)
                 else:
-                    try:
-                        quote = await fetch_quote_data(session, request)
-                        description = quote_description(quote)
-                    except NoChartData:
-                        raise
-                    except (aiohttp.ClientError, RuntimeError, TimeoutError, ValueError):
-                        pass  # precheck is best-effort; the image fetch still proves the chart.
-
-                    direct_url = finviz_chart_url(request, cache_bust=True)
-                    legacy_url = legacy_finviz_chart_url(request)
-                    try:
-                        image = await fetch_chart_image(session, request, direct_url)
-                    except NoChartData:
-                        raise
-                    except (aiohttp.ClientError, RuntimeError, TimeoutError):
-                        image = await fetch_chart_image(session, request, legacy_url)
+                    quote = await fetch_stock_chart_data(session, request)
+                image = render_price_chart_png(quote, request)
+                description = quote_description(quote)
         except NoChartData as error:
             await channel.send(str(error))
             return
         except Exception as error:
-            if request.futures or is_stock_yahoo_chart(request):
-                await channel.send(f"Upload failed ({error}).")
-                return
-            embed = discord.Embed(
-                title=chart_title(request),
-                color=0x2ECC71,
-            )
-            embed.set_image(url=legacy_finviz_chart_url(request, cache_bust=True))
-            await channel.send(f"Upload failed ({error}). Trying the legacy Finviz embed:", embed=embed)
+            await channel.send(f"Upload failed ({error}).")
             return
 
     filename = f"{request.ticker}_{request.timeframe}_{int(time.time())}.png"

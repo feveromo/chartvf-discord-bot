@@ -55,7 +55,7 @@ Ranges: `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`.
 Themes: `dark`, `light`.
 Scales: `linear`, `log`, `percent`.
 
-Bare stock commands default to the latest 5-minute chart. Default and stock intraday charts are rendered from Yahoo chart data, while explicit daily stock charts are rendered from Finviz quote data so they match Finviz's current daily candle. Futures intraday still uses Finviz's futures quote API. Discord also caps inline image previews, so there is no `big` mode.
+Bare stock commands default to the latest 5-minute chart. Default and stock intraday charts are rendered from Yahoo chart data, while explicit daily/weekly/monthly stock charts are rendered from Finviz quote data. Futures intraday still uses Finviz's futures quote API. Discord also caps inline image previews, so there is no `big` mode.
 
 ## Futures
 
