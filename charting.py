@@ -2,6 +2,7 @@ import datetime as dt
 import io
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -320,6 +321,7 @@ def chart_title(request: ChartRequest) -> str:
 
 
 ChartRow = tuple[int, float, float, float, float, float]
+SessionKey = tuple[str, object]
 
 
 def _safe_float(value: Any) -> float | None:
@@ -497,7 +499,7 @@ def _is_regular_stock_session(epoch: int) -> bool:
     return REGULAR_SESSION_START <= local_time < REGULAR_SESSION_END
 
 
-def _stock_extended_session_key(epoch: int) -> tuple[str, dt.date] | None:
+def _stock_extended_session_key(epoch: int) -> SessionKey | None:
     local = dt.datetime.fromtimestamp(epoch, dt.timezone.utc).astimezone(MARKET_TIME_ZONE)
     local_time = local.time()
     if STOCK_5M_START <= local_time < REGULAR_SESSION_START:
@@ -507,14 +509,22 @@ def _stock_extended_session_key(epoch: int) -> tuple[str, dt.date] | None:
     return None
 
 
-def _stock_extended_session_bands(
+def _futures_globex_session_key(epoch: int) -> SessionKey | None:
+    local_time = dt.datetime.fromtimestamp(epoch, dt.timezone.utc).astimezone(MARKET_TIME_ZONE).time()
+    if REGULAR_SESSION_START <= local_time < REGULAR_SESSION_END:
+        return None
+    return "globex", "globex"
+
+
+def _extended_session_bands(
     rows: list[ChartRow],
     x_positions: list[int],
     left: int,
     plot_right: int,
+    session_key_for_epoch: Callable[[int], SessionKey | None],
 ) -> list[tuple[int, int, str]]:
     bands: list[tuple[int, int, str]] = []
-    active: tuple[str, dt.date] | None = None
+    active: SessionKey | None = None
     start_pos = 0
 
     def append_band(start: int, end: int, kind: str) -> None:
@@ -524,7 +534,7 @@ def _stock_extended_session_bands(
             bands.append((band_left, band_right, kind))
 
     for pos, row in enumerate(rows):
-        key = _stock_extended_session_key(row[0])
+        key = session_key_for_epoch(row[0])
         if key == active:
             continue
         if active is not None:
@@ -535,6 +545,24 @@ def _stock_extended_session_bands(
     if active is not None:
         append_band(start_pos, len(rows) - 1, active[0])
     return bands
+
+
+def _stock_extended_session_bands(
+    rows: list[ChartRow],
+    x_positions: list[int],
+    left: int,
+    plot_right: int,
+) -> list[tuple[int, int, str]]:
+    return _extended_session_bands(rows, x_positions, left, plot_right, _stock_extended_session_key)
+
+
+def _futures_globex_session_bands(
+    rows: list[ChartRow],
+    x_positions: list[int],
+    left: int,
+    plot_right: int,
+) -> list[tuple[int, int, str]]:
+    return _extended_session_bands(rows, x_positions, left, plot_right, _futures_globex_session_key)
 
 
 def _clean_stock_5m_wicks(rows: list[ChartRow], request: ChartRequest) -> list[ChartRow]:
@@ -731,18 +759,20 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     vol_axis_high, vol_ticks = _volume_axis(_volume_scale_value(rows, request), request)
 
     x_positions = _chart_x_positions(len(candles), left, plot_w)
-    session_bands = (
-        _stock_extended_session_bands(rows, x_positions, left, plot_right)
-        if intraday and not request.futures
-        else []
-    )
+    if intraday and request.futures:
+        session_bands = _futures_globex_session_bands(rows, x_positions, left, plot_right)
+    elif intraday:
+        session_bands = _stock_extended_session_bands(rows, x_positions, left, plot_right)
+    else:
+        session_bands = []
     session_fills = {
         "pre": (34, 42, 58) if dark else (236, 244, 252),
         "after": (45, 39, 53) if dark else (250, 240, 247),
+        "globex": (34, 42, 58) if dark else (236, 244, 252),
     }
     session_boundary = (61, 76, 101) if dark else (184, 195, 211)
     session_text = (108, 126, 158) if dark else (112, 124, 143)
-    session_labels = {"pre": "PRE", "after": "AH"}
+    session_labels = {"pre": "PRE", "after": "AH", "globex": "GLOBEX"}
 
     def x_at(i: int) -> int:
         return x_positions[i]
@@ -1118,6 +1148,13 @@ def self_test() -> None:
     assert _stock_extended_session_bands(session_rows, [10, 20, 30, 40], 10, 40) == [
         (10, 15, "pre"),
         (25, 40, "after"),
+    ]
+    assert _futures_globex_session_key(et_epoch(7, 10)) == ("globex", "globex")
+    assert _futures_globex_session_key(et_epoch(10, 10)) is None
+    assert _futures_globex_session_key(et_epoch(16, 0)) == ("globex", "globex")
+    assert _futures_globex_session_bands(session_rows, [10, 20, 30, 40], 10, 40) == [
+        (10, 15, "globex"),
+        (25, 40, "globex"),
     ]
     live_quote_rows = {
         "date": [et_epoch(7, 5), et_epoch(7, 7) + 15],
