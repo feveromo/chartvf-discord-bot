@@ -656,6 +656,9 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     def y_at(value: float) -> int:
         return price_bottom - round((value - low) * (price_bottom - price_top) / (high - low))
 
+    def price_y_at(value: float) -> int:
+        return max(price_top, min(price_bottom, y_at(value)))
+
     def dashed(x1: int, y1: int, x2: int, y2: int) -> None:
         if y1 == y2:
             x = x1
@@ -734,7 +737,11 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
         draw.line(close_points, fill=line_color, width=2, joint="curve")
 
     for period, values in smas.items():
-        points = [(x_at(pos), y_at(scaled(values[i] or 0.0))) for pos, i in enumerate(indexes) if values[i] is not None]
+        points: list[tuple[int, int]] = []
+        for pos, i in enumerate(indexes):
+            value = values[i]
+            if value is not None:
+                points.append((x_at(pos), price_y_at(scaled(value))))
         if len(points) > 1:
             draw.line(points, fill=SMA_COLORS[period], width=SMA_LINE_WIDTH, joint="curve")
 
