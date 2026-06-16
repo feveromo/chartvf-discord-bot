@@ -20,8 +20,12 @@ DEFAULT_HEIGHT = 219
 CHART_RIGHT_MARGIN = 80
 MARKET_TIME_ZONE = ZoneInfo("America/New_York")
 STOCK_DAILY_VISIBLE_BARS = 240
-STOCK_WEEKLY_VISIBLE_BARS = 78
+STOCK_WEEKLY_VISIBLE_BARS = 240
 STOCK_INTRADAY_VISIBLE_BARS = 180
+STOCK_MONTHLY_VISIBLE_BARS = 240
+SMA_PERIODS = (20, 50, 200)
+SMA_LINE_WIDTH = 1
+SMA_COLORS = {20: (142, 43, 132), 50: (238, 126, 35), 200: (139, 111, 43)}
 FUTURES_INTRADAY_VISIBLE_BARS = 140
 STOCK_5M_START = dt.time(7, 0)
 STOCK_5M_END = dt.time(20, 0)
@@ -136,9 +140,31 @@ YAHOO_DATE_RANGES = {
     "max": "max",
 }
 YAHOO_DEFAULT_RANGES = {
-    "d": "1y",
-    "w": "2y",
-    "m": "10y",
+    "d": "2y",
+    "w": "10y",
+    "m": "max",
+}
+DAILY_SMA_FETCH_RANGES = {
+    "": "2y",
+    "m1": "1y",
+    "m3": "1y",
+    "m6": "2y",
+    "ytd": "2y",
+    "y1": "2y",
+    "y2": "5y",
+    "y5": "10y",
+    "max": "max",
+}
+WEEKLY_SMA_FETCH_RANGES = {
+    "": "10y",
+    "m1": "5y",
+    "m3": "5y",
+    "m6": "5y",
+    "ytd": "5y",
+    "y1": "5y",
+    "y2": "10y",
+    "y5": "10y",
+    "max": "max",
 }
 YAHOO_AGGREGATE_SECONDS = {
     "i3": 3 * 60,
@@ -255,24 +281,35 @@ def yahoo_chart_symbol(request: ChartRequest) -> str:
     return request.ticker
 
 
+def _yahoo_chart_range(request: ChartRequest) -> str:
+    if request.timeframe in YAHOO_INTRADAY_RANGES:
+        return YAHOO_INTRADAY_RANGES[request.timeframe]
+    if request.timeframe == "d":
+        return DAILY_SMA_FETCH_RANGES.get(request.date_range, "2y")
+    if request.timeframe == "w":
+        return WEEKLY_SMA_FETCH_RANGES.get(request.date_range, "10y")
+    if request.timeframe == "m":
+        return "max"
+    if request.date_range:
+        return YAHOO_DATE_RANGES.get(request.date_range, "1y")
+    return YAHOO_DEFAULT_RANGES.get(request.timeframe, "1y")
+
+
 def yahoo_chart_url(request: ChartRequest) -> str:
     interval = YAHOO_TIMEFRAME_INTERVALS.get(request.timeframe)
     if interval is None:
         raise ValueError(f"Chart data does not support `{request.timeframe_label}` charts.")
 
-    if request.date_range:
-        chart_range = YAHOO_DATE_RANGES.get(request.date_range, "1y")
-    elif request.timeframe in YAHOO_INTRADAY_RANGES:
-        chart_range = YAHOO_INTRADAY_RANGES[request.timeframe]
-    else:
-        chart_range = YAHOO_DEFAULT_RANGES.get(request.timeframe, "1y")
-
     params = {
-        "range": chart_range,
         "interval": interval,
         "includePrePost": "true" if not request.futures and request.timeframe == "i5" else "false",
         "events": "div,splits",
     }
+    if request.timeframe == "m":
+        params["period1"] = "0"
+        params["period2"] = str(int(dt.datetime.now(dt.timezone.utc).timestamp()))
+    else:
+        params["range"] = _yahoo_chart_range(request)
     symbol = quote(yahoo_chart_symbol(request), safe="=^")
     return f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?" + urlencode(params)
 
@@ -311,6 +348,28 @@ def _range_cutoff(last_epoch: int, date_range: str) -> int | None:
     return int((last - dt.timedelta(days=days)).timestamp()) if days else None
 
 
+def _collapse_monthly_rows(rows: list[ChartRow]) -> list[ChartRow]:
+    collapsed: list[ChartRow] = []
+    last_month: tuple[int, int] | None = None
+    for epoch, open_, high, low, close, volume in rows:
+        stamp = dt.datetime.fromtimestamp(epoch, dt.timezone.utc)
+        month = (stamp.year, stamp.month)
+        if month == last_month:
+            _, prev_open, prev_high, prev_low, _, prev_volume = collapsed[-1]
+            collapsed[-1] = (
+                epoch,
+                prev_open,
+                max(prev_high, high),
+                min(prev_low, low),
+                close,
+                max(prev_volume, volume),
+            )
+            continue
+        collapsed.append((epoch, open_, high, low, close, volume))
+        last_month = month
+    return collapsed
+
+
 def _quote_rows(quote: dict[str, Any], request: ChartRequest) -> list[ChartRow]:
     dates = quote.get("date") or []
     opens = quote.get("open") or []
@@ -319,12 +378,19 @@ def _quote_rows(quote: dict[str, Any], request: ChartRequest) -> list[ChartRow]:
     closes = quote.get("close") or []
     volumes = quote.get("volume") or []
     rows: list[ChartRow] = []
-    for i in range(min(map(len, (dates, opens, highs, lows, closes)))):
-        o, h, l, c = (_safe_float(values[i]) for values in (opens, highs, lows, closes))
+    last_close = _safe_float(quote.get("lastClose"))
+    row_count = min(map(len, (dates, opens, highs, lows, closes)))
+    for i in range(row_count):
+        o, h, l = (_safe_float(values[i]) for values in (opens, highs, lows))
+        c = _safe_float(closes[i])
+        if c is None and i == row_count - 1:
+            c = last_close
         if None in (o, h, l, c):
             continue
         v = _safe_float(volumes[i]) if i < len(volumes) else 0.0
         rows.append((int(dates[i]), o or 0.0, h or 0.0, l or 0.0, c or 0.0, v or 0.0))
+    if request.timeframe == "m":
+        rows = _collapse_monthly_rows(rows)
     if not rows:
         raise NoChartData(f"No chart data found for `{request.ticker}`.")
     return rows
@@ -392,6 +458,8 @@ def _visible_indexes(rows: list[ChartRow], request: ChartRequest) -> list[int]:
             count = STOCK_DAILY_VISIBLE_BARS
         elif request.timeframe == "w" and not request.futures:
             count = STOCK_WEEKLY_VISIBLE_BARS
+        elif request.timeframe == "m" and not request.futures:
+            count = STOCK_MONTHLY_VISIBLE_BARS
         else:
             count = {"d": 90, "w": 104, "m": 120}.get(request.timeframe, 90)
         indexes = list(range(max(0, len(rows) - count), len(rows)))
@@ -530,7 +598,6 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     up, down = (25, 200, 105), (255, 82, 82)
     line_color = (55, 160, 245) if dark else (25, 105, 210)
     vol_up, vol_down = (25, 120, 75), (128, 58, 68)
-    sma_colors = {20: (132, 42, 126), 50: (235, 126, 35), 200: (162, 136, 45)}
 
     def font(size: int, bold: bool = False) -> Any:
         name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
@@ -546,7 +613,7 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     axis_font = font(18)
     small_font = font(14)
     badge_font = font(17, True)
-    sma_font = font(16, True)
+    sma_font = font(16)
 
     image = Image.new("RGB", (width, height), bg)
     draw = ImageDraw.Draw(image)
@@ -573,7 +640,7 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
             return math.log(value)
         return value
 
-    smas = {period: _sma_values(all_rows, period) for period in (20, 50, 200)}
+    smas = {period: _sma_values(all_rows, period) for period in SMA_PERIODS}
     candles = [(i, d, scaled(o), scaled(h), scaled(l), scaled(c), v) for i, (d, o, h, l, c, v) in zip(indexes, rows)]
     scale_values = [value for _, _, o, h, l, c, _ in candles for value in (o, h, l, c)]
     low, high = min(scale_values), max(scale_values)
@@ -677,7 +744,7 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     for period, values in smas.items():
         points = [(x_at(pos), y_at(scaled(values[i] or 0.0))) for pos, i in enumerate(indexes) if values[i] is not None]
         if len(points) > 1:
-            draw.line(points, fill=sma_colors[period], width=2, joint="curve")
+            draw.line(points, fill=SMA_COLORS[period], width=SMA_LINE_WIDTH, joint="curve")
 
     last_idx = indexes[-1]
     last = all_rows[last_idx]
@@ -711,11 +778,10 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     change_w = draw.textbbox((0, 0), change_label, font=label_font)[2]
     draw.text((width - right - change_w - 8, 8), change_label, fill=change_color, font=label_font)
 
-    for row, period in enumerate((20, 50, 200)):
+    for row, period in enumerate(SMA_PERIODS):
         value = smas[period][last_idx]
         if value is not None:
-            draw.text((8, 46 + row * 22), f"SMA {period} · {_fmt(value)}", fill=sma_colors[period], font=sma_font)
-
+            draw.text((8, 46 + row * 22), f"SMA {period} · {_fmt(value)}", fill=SMA_COLORS[period], font=sma_font)
     if period_shell:
         side_font = font(24, True)
         label = request.timeframe_label.upper()
@@ -814,6 +880,30 @@ def self_test() -> None:
         ChartRequest("AMD", "i5", "5 min"),
     ) == 511.57
     assert _stock_previous_close({}, [488.45, 511.57, 551.24], ChartRequest("AMD", "d", "daily")) == 511.57
+    pending_rows = _quote_rows({
+        "date": [1, 2],
+        "open": [10, 11],
+        "high": [12, 13],
+        "low": [9, 10],
+        "close": [10.5, None],
+        "volume": [100, 120],
+        "lastClose": 12.5,
+    }, ChartRequest("AMD", "d", "daily"))
+    assert pending_rows[-1][4] == 12.5
+    def utc_epoch(year: int, month: int, day: int) -> int:
+        return int(dt.datetime(year, month, day, tzinfo=dt.timezone.utc).timestamp())
+    monthly_rows = _quote_rows({
+        "date": [utc_epoch(2026, 1, 1), utc_epoch(2026, 1, 15), utc_epoch(2026, 2, 1)],
+        "open": [10, 11, 20],
+        "high": [12, 15, 22],
+        "low": [9, 8, 19],
+        "close": [11, 14, 21],
+        "volume": [100, 80, 120],
+    }, ChartRequest("AMD", "m", "monthly"))
+    assert monthly_rows == [
+        (utc_epoch(2026, 1, 15), 10.0, 15.0, 8.0, 14.0, 100.0),
+        (utc_epoch(2026, 2, 1), 20.0, 22.0, 19.0, 21.0, 120.0),
+    ]
     assert parse_chart_command(";amd 1") == ChartRequest("AMD", "i1", "1 min")
     assert parse_chart_command(";amd 4h") == ChartRequest("AMD", "h4", "4 hour")
     assert "interval=1m" in yahoo_chart_url(ChartRequest("AMD", "i1", "1 min"))
@@ -823,12 +913,18 @@ def self_test() -> None:
     assert "includePrePost=false" in yahoo_chart_url(ChartRequest("AMD", "i15", "15 min"))
     assert "range=1mo" in yahoo_chart_url(ChartRequest("AMD", "i30", "30 min"))
     assert "range=6mo" in yahoo_chart_url(ChartRequest("AMD", "h4", "4 hour"))
+    assert "range=2y" in yahoo_chart_url(ChartRequest("AMD", "d", "daily"))
+    assert "range=2y" in yahoo_chart_url(ChartRequest("AMD", "d", "daily", date_range="y1"))
     assert "interval=1wk" in yahoo_chart_url(ChartRequest("AMD", "w", "weekly"))
-    sample_rows = [(i, 1.0, 1.0, 1.0, float(i + 1), 1.0) for i in range(200)]
+    assert "range=10y" in yahoo_chart_url(ChartRequest("AMD", "w", "weekly"))
+    monthly_url = yahoo_chart_url(ChartRequest("AMD", "m", "monthly"))
+    assert "interval=1mo" in monthly_url and "period1=0" in monthly_url and "period2=" in monthly_url
+    sample_rows = [(i, 1.0, 1.0, 1.0, float(i + 1), 1.0) for i in range(300)]
     assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "i15", "15 min"))) == 180
     assert len(_visible_indexes(sample_rows, ChartRequest("NQ", "i5", "5 min", futures=True))) == 140
     assert len(_visible_indexes(sample_rows + sample_rows, ChartRequest("AMD", "d", "daily"))) == STOCK_DAILY_VISIBLE_BARS
     assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "w", "weekly"))) == STOCK_WEEKLY_VISIBLE_BARS
+    assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "m", "monthly"))) == STOCK_MONTHLY_VISIBLE_BARS
     assert _nice_linear_axis(14.92, 32.73) == (14, 34, [34, 32, 30, 28, 26, 24, 22, 20, 18, 16, 14])
     assert _volume_axis(688_100_000, ChartRequest("SOFI", "w", "weekly")) == (1_000_000_000, [500_000_000])
     def et_epoch(hour: int, minute: int, day: int = 15) -> int:
