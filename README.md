@@ -1,6 +1,6 @@
-# Discord Finviz Chart Bot
+# ChartVF Discord Bot
 
-A tiny Discord bot that posts Finviz stock and futures charts. Nothing else.
+A tiny Discord bot that posts locally rendered stock and futures charts. Nothing else.
 
 ## Setup
 
@@ -55,15 +55,13 @@ Ranges: `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`.
 Themes: `dark`, `light`.
 Scales: `linear`, `log`, `percent`.
 
-Bare stock commands default to the latest 5-minute chart. Default and stock intraday charts are rendered from Yahoo chart data, while explicit daily/weekly/monthly stock charts are rendered from Finviz quote data. Futures intraday still uses Finviz's futures quote API. Discord also caps inline image previews, so there is no `big` mode.
+Bare stock commands default to the latest 5-minute chart. All chart images are rendered locally from market chart data. Discord also caps inline image previews, so there is no `big` mode.
 
 ## Futures
 
-Futures use `;fut`/`;future`/`;futures`; `;f` remains Ford (`F`). Futures are
-rendered locally from Finviz's futures quote API (`instrument=futures`) because
-Finviz's image renderer collides with stock tickers for roots like `ES` and `CL`.
-This means roots like `ES`, `NQ`, `GC`, `CL`, `6E`, and `VX` work when Finviz has
-quote data for them.
+Futures use `;fut`/`;future`/`;futures`; `;f` remains Ford (`F`). Futures roots
+are mapped to market symbols such as `ES=F`, `NQ=F`, `GC=F`, `CL=F`, and `6E=F`
+for chart data, then rendered locally by the bot.
 
 ## Checks
 

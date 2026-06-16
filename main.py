@@ -9,15 +9,14 @@ from charting import (
     ChartRequest,
     NoChartData,
     _safe_float,
+    aggregate_yahoo_chart_data,
     _stock_previous_close,
     chart_title,
-    finviz_quote_api_url,
-    is_stock_quote_chart,
     parse_chart_command,
     quote_description,
     render_price_chart_png,
     self_test,
-    yahoo_stock_chart_url,
+    yahoo_chart_url,
 )
 
 
@@ -30,7 +29,7 @@ import aiohttp
 import discord
 from dotenv import load_dotenv
 
-HELP_TEXT = """**Finviz chart bot**
+HELP_TEXT = """**ChartVF chart bot**
 
 **Syntax**
 `;TICKER [timeframe] [type] [range] [theme] [scale]` — stocks
@@ -57,13 +56,10 @@ Scales: `linear`, `log`, `percent`
 
 Options can be in any order after the ticker.
 
-**Futures** (`;fut`/`;future`/`;futures`): `;f` is still Ford (`F`). Futures are
-rendered from Finviz's futures quote API, so roots like `ES`, `NQ`, `GC`, `CL`,
-`6E`, and `VX` work even when Finviz's stock image endpoint would collide.
+**Futures** (`;fut`/`;future`/`;futures`): `;f` is still Ford (`F`).
 
-**Stock freshness**: bare stock commands default to the latest 5-minute chart.
-Default and stock intraday charts use Yahoo chart data. Explicit daily, weekly,
-and monthly stock charts are rendered from Finviz quote data.
+**Freshness**: bare stock commands default to the latest 5-minute chart. Every
+chart image is rendered locally from market chart data.
 """
 
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=12)
@@ -106,81 +102,88 @@ async def on_message(message: discord.Message) -> None:
         await send_chart(message.channel, request)
 
 
-async def fetch_quote_data(session: aiohttp.ClientSession, request: ChartRequest) -> dict[str, Any]:
-    async with session.get(finviz_quote_api_url(request), headers={"Accept": "application/json"}) as response:
-        if response.status == 404:
-            raise NoChartData(f"Finviz has no chart data for `{request.ticker}`.")
+async def fetch_daily_previous_close(session: aiohttp.ClientSession, request: ChartRequest) -> float | None:
+    daily_request = ChartRequest(
+        request.ticker,
+        "d",
+        "daily",
+        date_range="m1",
+        date_range_label="1 month",
+        futures=request.futures,
+    )
+    async with session.get(yahoo_chart_url(daily_request), headers={"Accept": "application/json"}) as response:
         if response.status != 200:
-            raise RuntimeError(f"Finviz quote check returned HTTP {response.status}")
+            return None
         data = await response.json(content_type=None)
-    if not data.get("date"):
-        raise NoChartData(f"Finviz has no chart data for `{request.ticker}`.")
-    return data
+
+    chart = data.get("chart") or {}
+    results = chart.get("result") or []
+    if not results:
+        return None
+    raw_quote = ((results[0].get("indicators") or {}).get("quote") or [{}])[0]
+    closes = raw_quote.get("close") or []
+    valid_closes = [close for close in (_safe_float(value) for value in closes) if close is not None]
+    return valid_closes[-2] if len(valid_closes) > 1 else None
 
 
-async def fetch_stock_chart_data(session: aiohttp.ClientSession, request: ChartRequest) -> dict[str, Any]:
-    async with session.get(yahoo_stock_chart_url(request), headers={"Accept": "application/json"}) as response:
+async def fetch_market_chart_data(session: aiohttp.ClientSession, request: ChartRequest) -> dict[str, Any]:
+    async with session.get(yahoo_chart_url(request), headers={"Accept": "application/json"}) as response:
         if response.status == 404:
-            raise NoChartData(f"Yahoo has no chart data for `{request.ticker}`.")
+            raise NoChartData(f"No chart data found for `{request.ticker}`.")
         if response.status != 200:
-            raise RuntimeError(f"Yahoo chart check returned HTTP {response.status}")
+            raise RuntimeError(f"Chart data fetch returned HTTP {response.status}")
         data = await response.json(content_type=None)
 
     chart = data.get("chart") or {}
     if chart.get("error"):
-        raise NoChartData(f"Yahoo has no chart data for `{request.ticker}`.")
+        raise NoChartData(f"No chart data found for `{request.ticker}`.")
     results = chart.get("result") or []
     if not results:
-        raise NoChartData(f"Yahoo has no chart data for `{request.ticker}`.")
+        raise NoChartData(f"No chart data found for `{request.ticker}`.")
 
     result = results[0]
     meta = result.get("meta") or {}
-    quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    raw_quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
     dates = result.get("timestamp") or []
-    closes = quote.get("close") or []
+    closes = raw_quote.get("close") or []
     valid_closes = [close for close in (_safe_float(value) for value in closes) if close is not None]
     last = _safe_float(meta.get("regularMarketPrice")) or next(
         (_safe_float(value) for value in reversed(closes) if _safe_float(value) is not None),
         None,
     )
     prev = _stock_previous_close(meta, valid_closes, request)
+    if request.timeframe != "d":
+        prev = await fetch_daily_previous_close(session, request) or prev
     change = (last - prev) if last is not None and prev else None
-    return {
+    quote = {
         "ticker": request.ticker,
-        "name": request.ticker,
+        "name": meta.get("shortName") or meta.get("longName") or request.ticker,
         "date": dates,
-        "open": quote.get("open") or [],
-        "high": quote.get("high") or [],
-        "low": quote.get("low") or [],
+        "open": raw_quote.get("open") or [],
+        "high": raw_quote.get("high") or [],
+        "low": raw_quote.get("low") or [],
         "close": closes,
-        "volume": quote.get("volume") or [],
+        "volume": raw_quote.get("volume") or [],
         "lastClose": last,
         "lastTime": meta.get("regularMarketTime") or (dates[-1] if dates else None),
         "prevClose": prev,
         "perfDayUsd": change,
         "perfDayPct": (change / prev * 100) if change is not None and prev else None,
     }
+    return aggregate_yahoo_chart_data(quote, request)
 
 
 async def send_chart(channel: discord.abc.Messageable, request: ChartRequest) -> None:
     headers = {
         "User-Agent": USER_AGENT,
-        "Referer": (
-            f"https://finviz.com/futures_charts?t={request.ticker}" if request.futures
-            else f"https://finviz.com/quote.ashx?t={request.ticker}"
-        ),
         "Cache-Control": "no-cache",
-        "Cookie": f"chartsTheme={request.theme}",
     }
     description = None
 
     async with channel.typing():
         try:
             async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT, headers=headers) as session:
-                if request.futures or is_stock_quote_chart(request):
-                    quote = await fetch_quote_data(session, request)
-                else:
-                    quote = await fetch_stock_chart_data(session, request)
+                quote = await fetch_market_chart_data(session, request)
                 image = render_price_chart_png(quote, request)
                 description = quote_description(quote)
         except NoChartData as error:

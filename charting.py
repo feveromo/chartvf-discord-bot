@@ -2,10 +2,9 @@ import datetime as dt
 import io
 import math
 import re
-import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 PREFIX = ";"
@@ -99,19 +98,57 @@ STOCK_INTRADAY_INTERVALS = {
     "h": "60m",
     "h4": "4h",
 }
-STOCK_INTRADAY_RANGES = {
+YAHOO_TIMEFRAME_INTERVALS = {
+    "d": "1d",
+    "w": "1wk",
+    "m": "1mo",
+    "i1": "1m",
+    "i2": "2m",
+    "i3": "1m",
+    "i5": "5m",
+    "i10": "5m",
+    "i15": "15m",
+    "i30": "30m",
+    "h": "60m",
+    "h2": "60m",
+    "h4": "4h",
+}
+YAHOO_INTRADAY_RANGES = {
     "i1": "5d",
     "i2": "5d",
+    "i3": "5d",
     "i5": "5d",
+    "i10": "5d",
     "i15": "5d",
     "i30": "1mo",
     "h": "1mo",
+    "h2": "1mo",
     "h4": "6mo",
+}
+YAHOO_DATE_RANGES = {
+    "m1": "1mo",
+    "m3": "3mo",
+    "m6": "6mo",
+    "ytd": "ytd",
+    "y1": "1y",
+    "y2": "2y",
+    "y5": "5y",
+    "max": "max",
+}
+YAHOO_DEFAULT_RANGES = {
+    "d": "1y",
+    "w": "2y",
+    "m": "10y",
+}
+YAHOO_AGGREGATE_SECONDS = {
+    "i3": 3 * 60,
+    "i10": 10 * 60,
+    "h2": 2 * 60 * 60,
 }
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,14}$")
 STOCK_INTRADAY_UNSUPPORTED_MESSAGE = (
     "Stock intraday supports `1`, `2`, `5`, `15`, `30`, `60`, and `4h` "
-    "via Yahoo chart data. Use `d`, `w`, or `m` for stock quote charts."
+    "via market chart data. Use `d`, `w`, or `m` for higher timeframes."
 )
 
 # Futures must not use `;f`: that is Ford's stock ticker. Use `;fut ES`.
@@ -212,42 +249,32 @@ def parse_chart_command(content: str) -> ChartRequest | None:
     )
 
 
-def finviz_quote_api_url(request: ChartRequest) -> str:
+def yahoo_chart_symbol(request: ChartRequest) -> str:
+    if request.futures:
+        return f"{request.ticker}=F"
+    return request.ticker
+
+
+def yahoo_chart_url(request: ChartRequest) -> str:
+    interval = YAHOO_TIMEFRAME_INTERVALS.get(request.timeframe)
+    if interval is None:
+        raise ValueError(f"Chart data does not support `{request.timeframe_label}` charts.")
+
+    if request.date_range:
+        chart_range = YAHOO_DATE_RANGES.get(request.date_range, "1y")
+    elif request.timeframe in YAHOO_INTRADAY_RANGES:
+        chart_range = YAHOO_INTRADAY_RANGES[request.timeframe]
+    else:
+        chart_range = YAHOO_DEFAULT_RANGES.get(request.timeframe, "1y")
+
     params = {
-        "ticker": request.ticker,
-        "instrument": "futures" if request.futures else "stock",
-        "timeframe": request.timeframe,
-        "premarket": "0",
-        "aftermarket": "0",
-        "patterns": "0",
-        "events": "1",
-        "chartEventsVersion": "4",
-        "rev": str(int(time.time() * 1000)),
+        "range": chart_range,
+        "interval": interval,
+        "includePrePost": "true" if not request.futures and request.timeframe == "i5" else "false",
+        "events": "div,splits",
     }
-    return "https://finviz.com/api/quote?" + urlencode(params)
-
-
-def yahoo_stock_chart_url(request: ChartRequest) -> str:
-    if request.timeframe not in STOCK_INTRADAY_INTERVALS:
-        raise ValueError(f"Yahoo chart data does not support `{request.timeframe_label}` stock charts.")
-    params = {
-        "range": STOCK_INTRADAY_RANGES[request.timeframe],
-        "interval": STOCK_INTRADAY_INTERVALS[request.timeframe],
-        "includePrePost": "true" if request.timeframe == "i5" else "false",
-    }
-    return f"https://query1.finance.yahoo.com/v8/finance/chart/{request.ticker}?" + urlencode(params)
-
-
-def is_stock_intraday(request: ChartRequest) -> bool:
-    return not request.futures and request.timeframe in STOCK_INTRADAY_INTERVALS
-
-
-def is_stock_quote_chart(request: ChartRequest) -> bool:
-    return not request.futures and request.timeframe in {"d", "w", "m"}
-
-
-def is_stock_yahoo_chart(request: ChartRequest) -> bool:
-    return is_stock_intraday(request)
+    symbol = quote(yahoo_chart_symbol(request), safe="=^")
+    return f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?" + urlencode(params)
 
 
 def chart_title(request: ChartRequest) -> str:
@@ -301,6 +328,37 @@ def _quote_rows(quote: dict[str, Any], request: ChartRequest) -> list[ChartRow]:
     if not rows:
         raise NoChartData(f"No chart data found for `{request.ticker}`.")
     return rows
+
+
+def aggregate_yahoo_chart_data(quote: dict[str, Any], request: ChartRequest) -> dict[str, Any]:
+    bucket_seconds = YAHOO_AGGREGATE_SECONDS.get(request.timeframe)
+    if bucket_seconds is None:
+        return quote
+
+    buckets: list[ChartRow] = []
+    for epoch, open_, high, low, close, volume in _quote_rows(quote, request):
+        bucket_epoch = (epoch // bucket_seconds) * bucket_seconds
+        if not buckets or buckets[-1][0] != bucket_epoch:
+            buckets.append((bucket_epoch, open_, high, low, close, volume))
+            continue
+        prev_epoch, prev_open, prev_high, prev_low, _, prev_volume = buckets[-1]
+        buckets[-1] = (
+            prev_epoch,
+            prev_open,
+            max(prev_high, high),
+            min(prev_low, low),
+            close,
+            prev_volume + volume,
+        )
+
+    aggregated = dict(quote)
+    aggregated["date"] = [row[0] for row in buckets]
+    aggregated["open"] = [row[1] for row in buckets]
+    aggregated["high"] = [row[2] for row in buckets]
+    aggregated["low"] = [row[3] for row in buckets]
+    aggregated["close"] = [row[4] for row in buckets]
+    aggregated["volume"] = [row[5] for row in buckets]
+    return aggregated
 
 
 def _stock_5m_today_indexes(rows: list[ChartRow], request: ChartRequest) -> list[int] | None:
@@ -401,18 +459,7 @@ def _nice_linear_axis(low: float, high: float) -> tuple[float, float, list[float
     span = high - low
     if span <= 0:
         return low - 1, high + 1, [high + 1, low - 1]
-    rough_step = span / 10
-    magnitude = 10 ** math.floor(math.log10(rough_step))
-    residual = rough_step / magnitude
-    if residual <= 1:
-        multiplier = 1
-    elif residual <= 2:
-        multiplier = 2
-    elif residual <= 5:
-        multiplier = 5
-    else:
-        multiplier = 10
-    step = multiplier * magnitude
+    step = _nice_step(span / 10)
     nice_low = math.floor(low / step) * step
     nice_high = math.ceil(high / step) * step
     ticks: list[float] = []
@@ -421,6 +468,36 @@ def _nice_linear_axis(low: float, high: float) -> tuple[float, float, list[float
         ticks.append(round(value, 10))
         value -= step
     return nice_low, nice_high, ticks
+
+
+def _nice_step(value: float) -> float:
+    magnitude = 10 ** math.floor(math.log10(value))
+    residual = value / magnitude
+    if residual <= 1:
+        multiplier = 1
+    elif residual <= 2:
+        multiplier = 2
+    elif residual <= 5:
+        multiplier = 5
+    else:
+        multiplier = 10
+    return multiplier * magnitude
+
+
+def _volume_axis(value: float, request: ChartRequest) -> tuple[float, list[float]]:
+    if value <= 0:
+        return 1, []
+    target_steps = 2 if request.timeframe in {"w", "m"} else 5
+    step = _nice_step(value / target_steps)
+    high = math.ceil(value / step) * step
+    if request.timeframe == "w":
+        return high, [step]
+    ticks: list[float] = []
+    tick = step
+    while tick <= high + step / 2:
+        ticks.append(tick)
+        tick += step
+    return high, ticks
 
 
 def _date_label(epoch: int, intraday: bool, span: int) -> str:
@@ -485,13 +562,14 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     base = rows[0][4]
     intraday = request.timeframe.startswith(("i", "h"))
     span = rows[-1][0] - rows[0][0]
+    period_shell = request.timeframe in {"w", "m"} and not intraday
 
     def scaled(value: float) -> float:
         if request.scale == "percentage":
             return ((value / base) - 1.0) * 100.0
         if request.scale == "logarithmic":
             if value <= 0:
-                raise NoChartData(f"Finviz has non-positive values for `{request.ticker}`, so log scale won't work.")
+                raise NoChartData(f"Chart data has non-positive values for `{request.ticker}`, so log scale won't work.")
             return math.log(value)
         return value
 
@@ -509,6 +587,7 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
         low, high = low - pad, high + pad
         y_ticks = [high - step * (high - low) / 4 for step in range(5)]
     vol_max = max((row[5] for row in rows), default=1) or 1
+    vol_axis_high, vol_ticks = _volume_axis(vol_max, request)
 
     x_positions = _chart_x_positions(len(candles), left, plot_w)
 
@@ -533,7 +612,10 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     for value in y_ticks:
         y = y_at(value)
         dashed(left, y, width - right, y)
-        if not (request.scale == "linear" and low == 0 and value == 0):
+        if not (
+            (request.scale == "linear" and low == 0 and value == 0)
+            or (period_shell and value == high)
+        ):
             draw.text((width - right + 8, y - 11), _axis_label(value, request), fill=text, font=axis_font)
     x_ticks: list[tuple[int, str]]
     if request.timeframe == "m" and not intraday:
@@ -581,7 +663,7 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     for pos, (_, _, o, h, l, c, v) in enumerate(candles):
         x = x_at(pos)
         color = up if c >= o else down
-        vh = round((v / vol_max) * (vol_bottom - vol_top))
+        vh = round((v / vol_axis_high) * (vol_bottom - vol_top))
         draw.rectangle((x - candle_w // 2, vol_bottom - vh, x + candle_w // 2, vol_bottom), fill=vol_up if c >= o else vol_down)
         if request.chart_type == "l":
             close_points.append((x, y_at(c)))
@@ -607,19 +689,25 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     date = dt.datetime.fromtimestamp(last[0], dt.timezone.utc).strftime("%b %d")
     change_label = f"{change:+.2f} ({pct:+.2f}%)"
 
-    header_x = 8
-    header_parts = [
-        (request.ticker, strong),
-        (f"   {date}", text),
-        ("   O", text), (_fmt(last[1]), candle_color),
-        ("   H", text), (_fmt(last[2]), candle_color),
-        ("   L", text), (_fmt(last[3]), candle_color),
-        ("   C", text), (_fmt(last[4]), candle_color),
-        ("   Vol", text), (_fmt_volume(last[5]), candle_color),
-    ]
-    for part, color in header_parts:
-        draw.text((header_x, 6), part, fill=color, font=header_font)
-        header_x += draw.textbbox((0, 0), part, font=header_font)[2]
+    if period_shell:
+        title_font = font(38, True)
+        draw.text((8, 0), request.ticker, fill=strong, font=title_font)
+        title_w = draw.textbbox((8, 0), request.ticker, font=title_font)[2]
+        draw.text((title_w + 14, 10), date, fill=text, font=header_font)
+    else:
+        header_x = 8
+        header_parts = [
+            (request.ticker, strong),
+            (f"   {date}", text),
+            ("   O", text), (_fmt(last[1]), candle_color),
+            ("   H", text), (_fmt(last[2]), candle_color),
+            ("   L", text), (_fmt(last[3]), candle_color),
+            ("   C", text), (_fmt(last[4]), candle_color),
+            ("   Vol", text), (_fmt_volume(last[5]), candle_color),
+        ]
+        for part, color in header_parts:
+            draw.text((header_x, 6), part, fill=color, font=header_font)
+            header_x += draw.textbbox((0, 0), part, font=header_font)[2]
     change_w = draw.textbbox((0, 0), change_label, font=label_font)[2]
     draw.text((width - right - change_w - 8, 8), change_label, fill=change_color, font=label_font)
 
@@ -628,15 +716,23 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
         if value is not None:
             draw.text((8, 46 + row * 22), f"SMA {period} · {_fmt(value)}", fill=sma_colors[period], font=sma_font)
 
+    if period_shell:
+        side_font = font(24, True)
+        label = request.timeframe_label.upper()
+        label_img = Image.new("RGBA", (220, 42), (0, 0, 0, 0))
+        label_draw = ImageDraw.Draw(label_img)
+        label_draw.text((0, 0), label, fill=text + (255,), font=side_font)
+        label_img = label_img.crop(label_img.getbbox() or (0, 0, 1, 1)).rotate(90, expand=True)
+        image.paste(label_img, (18, price_top + (price_bottom - price_top - label_img.height) // 2), label_img)
+
     last_scaled = scaled(last[4])
     badge_text = _axis_label(last_scaled, request)
     badge_w = draw.textbbox((0, 0), badge_text, font=badge_font)[2] + 10
     bx, by = width - badge_w - 6, max(price_top, min(price_bottom - 25, y_at(last_scaled) - 13))
     draw.rounded_rectangle((bx, by, bx + badge_w, by + 25), radius=2, fill=(245, 211, 65))
     draw.text((bx + 6, by + 2), badge_text, fill=(22, 24, 30), font=badge_font)
-    for step in range(1, 6):
-        value = vol_max * step / 5
-        y = vol_bottom - round(step * (vol_bottom - vol_top) / 5)
+    for value in vol_ticks:
+        y = vol_bottom - round((value / vol_axis_high) * (vol_bottom - vol_top))
         draw.text((6, y - 9), _fmt_volume(value), fill=text, font=small_font)
 
     output = io.BytesIO()
@@ -657,7 +753,10 @@ def _fmt_volume(value: Any) -> str:
         return "n/a"
     for suffix, scale in (("B", 1_000_000_000), ("M", 1_000_000), ("K", 1_000)):
         if abs(number) >= scale:
-            return f"{number / scale:.1f}{suffix}"
+            scaled = number / scale
+            if suffix != "B" and abs(scaled) >= 100:
+                return f"{scaled:.0f}{suffix}"
+            return f"{scaled:.1f}{suffix}"
     return f"{number:,.0f}"
 
 
@@ -717,25 +816,21 @@ def self_test() -> None:
     assert _stock_previous_close({}, [488.45, 511.57, 551.24], ChartRequest("AMD", "d", "daily")) == 511.57
     assert parse_chart_command(";amd 1") == ChartRequest("AMD", "i1", "1 min")
     assert parse_chart_command(";amd 4h") == ChartRequest("AMD", "h4", "4 hour")
-    assert "interval=1m" in yahoo_stock_chart_url(ChartRequest("AMD", "i1", "1 min"))
-    assert "range=5d" in yahoo_stock_chart_url(ChartRequest("AMD", "i5", "5 min"))
-    assert "interval=5m" in yahoo_stock_chart_url(ChartRequest("AMD", "i5", "5 min"))
-    assert "includePrePost=true" in yahoo_stock_chart_url(ChartRequest("AMD", "i5", "5 min"))
-    assert "includePrePost=false" in yahoo_stock_chart_url(ChartRequest("AMD", "i15", "15 min"))
-    assert "range=1mo" in yahoo_stock_chart_url(ChartRequest("AMD", "i30", "30 min"))
-    assert "range=6mo" in yahoo_stock_chart_url(ChartRequest("AMD", "h4", "4 hour"))
-    assert is_stock_intraday(ChartRequest("AMD", "i1", "1 min"))
-    assert is_stock_quote_chart(ChartRequest("AMD", "d", "daily"))
-    assert is_stock_quote_chart(ChartRequest("AMD", "w", "weekly"))
-    assert is_stock_quote_chart(ChartRequest("AMD", "m", "monthly"))
-    assert not is_stock_quote_chart(ChartRequest("ES", "d", "daily", futures=True))
-    assert not is_stock_yahoo_chart(ChartRequest("AMD", "d", "daily"))
+    assert "interval=1m" in yahoo_chart_url(ChartRequest("AMD", "i1", "1 min"))
+    assert "range=5d" in yahoo_chart_url(ChartRequest("AMD", "i5", "5 min"))
+    assert "interval=5m" in yahoo_chart_url(ChartRequest("AMD", "i5", "5 min"))
+    assert "includePrePost=true" in yahoo_chart_url(ChartRequest("AMD", "i5", "5 min"))
+    assert "includePrePost=false" in yahoo_chart_url(ChartRequest("AMD", "i15", "15 min"))
+    assert "range=1mo" in yahoo_chart_url(ChartRequest("AMD", "i30", "30 min"))
+    assert "range=6mo" in yahoo_chart_url(ChartRequest("AMD", "h4", "4 hour"))
+    assert "interval=1wk" in yahoo_chart_url(ChartRequest("AMD", "w", "weekly"))
     sample_rows = [(i, 1.0, 1.0, 1.0, float(i + 1), 1.0) for i in range(200)]
     assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "i15", "15 min"))) == 180
     assert len(_visible_indexes(sample_rows, ChartRequest("NQ", "i5", "5 min", futures=True))) == 140
     assert len(_visible_indexes(sample_rows + sample_rows, ChartRequest("AMD", "d", "daily"))) == STOCK_DAILY_VISIBLE_BARS
     assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "w", "weekly"))) == STOCK_WEEKLY_VISIBLE_BARS
     assert _nice_linear_axis(14.92, 32.73) == (14, 34, [34, 32, 30, 28, 26, 24, 22, 20, 18, 16, 14])
+    assert _volume_axis(688_100_000, ChartRequest("SOFI", "w", "weekly")) == (1_000_000_000, [500_000_000])
     def et_epoch(hour: int, minute: int, day: int = 15) -> int:
         return int(dt.datetime(2026, 6, day, hour, minute, tzinfo=MARKET_TIME_ZONE).timestamp())
     today_rows = [
@@ -768,7 +863,7 @@ def self_test() -> None:
         parse_chart_command(";spy 10")
     except ValueError as error:
         assert "Stock intraday supports" in str(error)
-        assert "Yahoo chart data" in str(error)
+        assert "market chart data" in str(error)
     else:
         raise AssertionError("unsupported stock intraday alias should be rejected")
 
@@ -783,7 +878,24 @@ def self_test() -> None:
     assert fut_req is not None
     assert fut_req.futures and fut_req.ticker == "GC" and fut_req.date_range == "y1"
     assert chart_title(ChartRequest("ES", futures=True)).endswith("futures chart")
-    assert "instrument=futures" in finviz_quote_api_url(ChartRequest("ES", futures=True))
+    assert "ES=F" in yahoo_chart_url(ChartRequest("ES", futures=True))
+    assert "interval=1m" in yahoo_chart_url(ChartRequest("ES", "i3", "3 min", futures=True))
+    assert "interval=5m" in yahoo_chart_url(ChartRequest("ES", "i10", "10 min", futures=True))
+    aggregated = aggregate_yahoo_chart_data({
+        "ticker": "ES",
+        "date": [0, 60, 120, 180],
+        "open": [10, 11, 12, 13],
+        "high": [11, 12, 13, 14],
+        "low": [9, 10, 11, 12],
+        "close": [10.5, 11.5, 12.5, 13.5],
+        "volume": [1, 2, 3, 4],
+    }, ChartRequest("ES", "i3", "3 min", futures=True))
+    assert aggregated["date"] == [0, 180]
+    assert aggregated["open"] == [10.0, 13.0]
+    assert aggregated["high"] == [13.0, 14.0]
+    assert aggregated["low"] == [9.0, 12.0]
+    assert aggregated["close"] == [12.5, 13.5]
+    assert aggregated["volume"] == [6.0, 4.0]
     assert parse_chart_command(";fut 6e") == ChartRequest("6E", futures=True)
     sample_png = render_price_chart_png({
         "ticker": "ES",
