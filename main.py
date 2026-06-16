@@ -14,6 +14,7 @@ from charting import (
     chart_title,
     finviz_chart_url,
     finviz_quote_api_url,
+    is_stock_daily_quote_chart,
     is_stock_yahoo_chart,
     legacy_finviz_chart_url,
     parse_chart_command,
@@ -65,8 +66,9 @@ rendered from Finviz's futures quote API, so roots like `ES`, `NQ`, `GC`, `CL`,
 `6E`, and `VX` work even when Finviz's stock image endpoint would collide.
 
 **Stock freshness**: bare stock commands default to the latest 5-minute chart.
-Default, daily, and stock intraday charts are rendered from Yahoo chart data so
-the candle, price badge, and updated timestamp come from the same fresher feed.
+Default and stock intraday charts use Yahoo chart data. Explicit daily stock
+charts are rendered from Finviz quote data so they match Finviz's current daily
+candle.
 """
 
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=12)
@@ -194,6 +196,10 @@ async def send_chart(channel: discord.abc.Messageable, request: ChartRequest) ->
         try:
             async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT, headers=headers) as session:
                 if request.futures:
+                    quote = await fetch_quote_data(session, request)
+                    image = render_price_chart_png(quote, request)
+                    description = quote_description(quote)
+                elif is_stock_daily_quote_chart(request):
                     quote = await fetch_quote_data(session, request)
                     image = render_price_chart_png(quote, request)
                     description = quote_description(quote)

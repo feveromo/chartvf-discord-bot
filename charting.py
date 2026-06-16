@@ -18,9 +18,10 @@ DEFAULT_SCALE = "linear"
 DEFAULT_SCALE_FACTOR = 2
 DEFAULT_WIDTH = 466
 DEFAULT_HEIGHT = 219
-CHART_RIGHT_MARGIN = 96
+CHART_RIGHT_MARGIN = 80
 MARKET_TIME_ZONE = ZoneInfo("America/New_York")
 CHART_IMAGE_MIN_BYTES = 10_000
+STOCK_DAILY_VISIBLE_BARS = 240
 STOCK_INTRADAY_VISIBLE_BARS = 180
 FUTURES_INTRADAY_VISIBLE_BARS = 140
 STOCK_5M_START = dt.time(7, 0)
@@ -110,18 +111,6 @@ STOCK_INTRADAY_RANGES = {
     "i30": "1mo",
     "h": "1mo",
     "h4": "6mo",
-}
-STOCK_YAHOO_INTERVALS = STOCK_INTRADAY_INTERVALS | {"d": "1d"}
-STOCK_DAILY_RANGES = {
-    "": "1y",
-    "m1": "1y",
-    "m3": "1y",
-    "m6": "1y",
-    "ytd": "1y",
-    "y1": "1y",
-    "y2": "2y",
-    "y5": "5y",
-    "max": "max",
 }
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,14}$")
 STOCK_INTRADAY_UNSUPPORTED_MESSAGE = (
@@ -292,15 +281,11 @@ def finviz_quote_api_url(request: ChartRequest) -> str:
 
 
 def yahoo_stock_chart_url(request: ChartRequest) -> str:
-    if request.timeframe not in STOCK_YAHOO_INTERVALS:
+    if request.timeframe not in STOCK_INTRADAY_INTERVALS:
         raise ValueError(f"Yahoo chart data does not support `{request.timeframe_label}` stock charts.")
-    if request.timeframe == "d":
-        chart_range = STOCK_DAILY_RANGES.get(request.date_range, "6mo")
-    else:
-        chart_range = STOCK_INTRADAY_RANGES[request.timeframe]
     params = {
-        "range": chart_range,
-        "interval": STOCK_YAHOO_INTERVALS[request.timeframe],
+        "range": STOCK_INTRADAY_RANGES[request.timeframe],
+        "interval": STOCK_INTRADAY_INTERVALS[request.timeframe],
         "includePrePost": "true" if request.timeframe == "i5" else "false",
     }
     return f"https://query1.finance.yahoo.com/v8/finance/chart/{request.ticker}?" + urlencode(params)
@@ -310,8 +295,12 @@ def is_stock_intraday(request: ChartRequest) -> bool:
     return not request.futures and request.timeframe in STOCK_INTRADAY_INTERVALS
 
 
+def is_stock_daily_quote_chart(request: ChartRequest) -> bool:
+    return not request.futures and request.timeframe == "d"
+
+
 def is_stock_yahoo_chart(request: ChartRequest) -> bool:
-    return not request.futures and request.timeframe in STOCK_YAHOO_INTERVALS
+    return is_stock_intraday(request)
 
 
 def chart_title(request: ChartRequest) -> str:
@@ -394,6 +383,8 @@ def _visible_indexes(rows: list[ChartRow], request: ChartRequest) -> list[int]:
     else:
         if request.timeframe.startswith(("i", "h")):
             count = FUTURES_INTRADAY_VISIBLE_BARS if request.futures else STOCK_INTRADAY_VISIBLE_BARS
+        elif request.timeframe == "d" and not request.futures:
+            count = STOCK_DAILY_VISIBLE_BARS
         else:
             count = {"d": 90, "w": 104, "m": 120}.get(request.timeframe, 90)
         indexes = list(range(max(0, len(rows) - count), len(rows)))
@@ -457,6 +448,32 @@ def _axis_label(value: float, request: ChartRequest) -> str:
     return _fmt(value)
 
 
+def _nice_linear_axis(low: float, high: float) -> tuple[float, float, list[float]]:
+    span = high - low
+    if span <= 0:
+        return low - 1, high + 1, [high + 1, low - 1]
+    rough_step = span / 10
+    magnitude = 10 ** math.floor(math.log10(rough_step))
+    residual = rough_step / magnitude
+    if residual <= 1:
+        multiplier = 1
+    elif residual <= 2:
+        multiplier = 2
+    elif residual <= 5:
+        multiplier = 5
+    else:
+        multiplier = 10
+    step = multiplier * magnitude
+    nice_low = math.floor(low / step) * step
+    nice_high = math.ceil(high / step) * step
+    ticks: list[float] = []
+    value = nice_high
+    while value >= nice_low - step / 2:
+        ticks.append(round(value, 10))
+        value -= step
+    return nice_low, nice_high, ticks
+
+
 def _date_label(epoch: int, intraday: bool, span: int) -> str:
     stamp = dt.datetime.fromtimestamp(epoch, dt.timezone.utc)
     if intraday:
@@ -465,15 +482,22 @@ def _date_label(epoch: int, intraday: bool, span: int) -> str:
     return stamp.strftime("%b") if span < 400 * 86400 else stamp.strftime("%y")
 
 
+def _month_tick_label(epoch: int, span: int) -> str:
+    stamp = dt.datetime.fromtimestamp(epoch, dt.timezone.utc)
+    if span < 400 * 86400:
+        return stamp.strftime("%Y") if stamp.month == 1 else stamp.strftime("%b")
+    return stamp.strftime("%y")
+
+
 def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> bytes:
     # Pillow keeps text crisp without pulling in a full charting framework.
     from PIL import Image, ImageDraw, ImageFont
 
     width, height = DEFAULT_WIDTH * DEFAULT_SCALE_FACTOR, DEFAULT_HEIGHT * DEFAULT_SCALE_FACTOR
     dark = request.theme == "dark"
-    bg = (31, 34, 46) if dark else (250, 250, 250)
-    grid = (50, 55, 70) if dark else (214, 218, 226)
-    text = (160, 170, 190) if dark else (100, 108, 122)
+    bg = (30, 34, 44) if dark else (250, 250, 250)
+    grid = (43, 49, 62) if dark else (214, 218, 226)
+    text = (148, 160, 181) if dark else (100, 108, 122)
     strong = (176, 186, 206) if dark else (50, 55, 65)
     up, down = (25, 200, 105), (255, 82, 82)
     line_color = (55, 160, 245) if dark else (25, 105, 210)
@@ -489,12 +513,11 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
                 pass
         return ImageFont.load_default()
 
-    title_font = font(38, True)
     header_font = font(18)
     label_font = font(17, True)
     axis_font = font(18)
     small_font = font(14)
-    badge_font = font(19, True)
+    badge_font = font(17, True)
     sma_font = font(16, True)
 
     image = Image.new("RGB", (width, height), bg)
@@ -524,16 +547,16 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     smas = {period: _sma_values(all_rows, period) for period in (20, 50, 200)}
     candles = [(i, d, scaled(o), scaled(h), scaled(l), scaled(c), v) for i, (d, o, h, l, c, v) in zip(indexes, rows)]
     scale_values = [value for _, _, o, h, l, c, _ in candles for value in (o, h, l, c)]
-    for values in smas.values():
-        for i in indexes:
-            if values[i] is not None:
-                scale_values.append(scaled(values[i] or 0.0))
     low, high = min(scale_values), max(scale_values)
     if high == low:
         high += 1
         low -= 1
-    pad = (high - low) * 0.055
-    low, high = low - pad, high + pad
+    if request.scale == "linear":
+        low, high, y_ticks = _nice_linear_axis(low, high)
+    else:
+        pad = (high - low) * 0.055
+        low, high = low - pad, high + pad
+        y_ticks = [high - step * (high - low) / 4 for step in range(5)]
     vol_max = max((row[5] for row in rows), default=1) or 1
 
     x_positions = _chart_x_positions(len(candles), left, plot_w)
@@ -556,22 +579,38 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
                 draw.line((x1, y, x2, min(y + 8, y2)), fill=grid, width=1)
                 y += 14
 
-    for step in range(5):
-        value = high - step * (high - low) / 4
+    for value in y_ticks:
         y = y_at(value)
         dashed(left, y, width - right, y)
         draw.text((width - right + 8, y - 11), _axis_label(value, request), fill=text, font=axis_font)
+    x_ticks: list[tuple[int, str]]
+    if not intraday and len(rows) >= SPARSE_CHART_MIN_BARS:
+        x_ticks = []
+        previous_month: tuple[int, int] | None = None
+        for pos, row in enumerate(rows):
+            stamp = dt.datetime.fromtimestamp(row[0], dt.timezone.utc)
+            month = (stamp.year, stamp.month)
+            if month != previous_month:
+                x_ticks.append((pos, _month_tick_label(row[0], span)))
+                previous_month = month
+        if not 4 <= len(x_ticks) <= 18:
+            x_ticks = []
+    else:
+        x_ticks = []
+    if not x_ticks:
+        x_ticks = [
+            (round(step * (len(rows) - 1) / 5), _date_label(rows[round(step * (len(rows) - 1) / 5)][0], intraday, span))
+            for step in range(6)
+        ]
+
     drawn_sparse_labels: set[str] = set()
-    for step in range(6):
-        x = left + round(step * plot_w / 5)
+    for idx, label in x_ticks:
+        x = x_at(idx)
         dashed(x, price_top, x, vol_bottom)
-        idx = round(step * (len(rows) - 1) / 5)
-        label = _date_label(rows[idx][0], intraday, span)
         if len(rows) < SPARSE_CHART_MIN_BARS:
             if label in drawn_sparse_labels:
                 continue
             drawn_sparse_labels.add(label)
-            x = x_at(idx)
         label_w = draw.textbbox((0, 0), label, font=axis_font)[2]
         draw.text((max(0, min(width - right - label_w, x - label_w // 2)), vol_bottom + 6), label, fill=text, font=axis_font)
     draw.line((left, price_bottom, width - right, price_bottom), fill=grid, width=1)
@@ -603,12 +642,23 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     change = (_safe_float(quote.get("perfDayUsd")) if quote.get("perfDayUsd") is not None else last[4] - prev) or 0.0
     pct = (_safe_float(quote.get("perfDayPct")) if quote.get("perfDayPct") is not None else (change / prev * 100 if prev else 0.0)) or 0.0
     change_color = up if change >= 0 else down
+    candle_color = up if last[4] >= last[1] else down
     date = dt.datetime.fromtimestamp(last[0], dt.timezone.utc).strftime("%b %d")
     change_label = f"{change:+.2f} ({pct:+.2f}%)"
 
-    draw.text((8, 2), request.ticker, fill=strong, font=title_font)
-    title_w = draw.textbbox((8, 2), request.ticker, font=title_font)[2]
-    draw.text((title_w + 12, 10), date, fill=text, font=header_font)
+    header_x = 8
+    header_parts = [
+        (request.ticker, strong),
+        (f"   {date}", text),
+        ("   O", text), (_fmt(last[1]), candle_color),
+        ("   H", text), (_fmt(last[2]), candle_color),
+        ("   L", text), (_fmt(last[3]), candle_color),
+        ("   C", text), (_fmt(last[4]), candle_color),
+        ("   Vol", text), (_fmt_volume(last[5]), candle_color),
+    ]
+    for part, color in header_parts:
+        draw.text((header_x, 6), part, fill=color, font=header_font)
+        header_x += draw.textbbox((0, 0), part, font=header_font)[2]
     change_w = draw.textbbox((0, 0), change_label, font=label_font)[2]
     draw.text((width - right - change_w - 8, 8), change_label, fill=change_color, font=label_font)
 
@@ -617,20 +667,16 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
         if value is not None:
             draw.text((8, 46 + row * 22), f"SMA {period} · {_fmt(value)}", fill=sma_colors[period], font=sma_font)
 
-    label = request.timeframe_label.upper()
-    label_img = Image.new("RGBA", (180, 30), (0, 0, 0, 0))
-    label_draw = ImageDraw.Draw(label_img)
-    label_draw.text((0, 0), label, fill=text + (255,), font=label_font)
-    label_img = label_img.crop(label_img.getbbox() or (0, 0, 1, 1)).rotate(90, expand=True)
-    image.paste(label_img, (20, price_top + (price_bottom - price_top - label_img.height) // 2), label_img)
-
     last_scaled = scaled(last[4])
     badge_text = _axis_label(last_scaled, request)
-    badge_w = draw.textbbox((0, 0), badge_text, font=badge_font)[2] + 12
-    bx, by = width - badge_w - 6, max(price_top, min(price_bottom - 27, y_at(last_scaled) - 14))
-    draw.rounded_rectangle((bx, by, bx + badge_w, by + 27), radius=2, fill=(245, 211, 65))
+    badge_w = draw.textbbox((0, 0), badge_text, font=badge_font)[2] + 10
+    bx, by = width - badge_w - 6, max(price_top, min(price_bottom - 25, y_at(last_scaled) - 13))
+    draw.rounded_rectangle((bx, by, bx + badge_w, by + 25), radius=2, fill=(245, 211, 65))
     draw.text((bx + 6, by + 2), badge_text, fill=(22, 24, 30), font=badge_font)
-    draw.text((8, vol_top + 2), _fmt_volume(vol_max), fill=text, font=axis_font)
+    for step in range(1, 6):
+        value = vol_max * step / 5
+        y = vol_bottom - round(step * (vol_bottom - vol_top) / 5)
+        draw.text((6, y - 9), _fmt_volume(value), fill=text, font=small_font)
 
     output = io.BytesIO()
     image.save(output, format="PNG", optimize=True)
@@ -716,12 +762,7 @@ def self_test() -> None:
     assert _stock_previous_close({}, [488.45, 511.57, 551.24], ChartRequest("AMD", "d", "daily")) == 511.57
     assert parse_chart_command(";amd 1") == ChartRequest("AMD", "i1", "1 min")
     assert parse_chart_command(";amd 4h") == ChartRequest("AMD", "h4", "4 hour")
-    assert "range=1y" in yahoo_stock_chart_url(ranged) and "interval=1d" in yahoo_stock_chart_url(ranged)
     assert "interval=1m" in yahoo_stock_chart_url(ChartRequest("AMD", "i1", "1 min"))
-    assert all(
-        "range=1y" in yahoo_stock_chart_url(request)
-        for request in (ChartRequest("AMD", "d", "daily"), ChartRequest("AMD", "d", "daily", date_range="m1"))
-    )
     assert "range=5d" in yahoo_stock_chart_url(ChartRequest("AMD", "i5", "5 min"))
     assert "interval=5m" in yahoo_stock_chart_url(ChartRequest("AMD", "i5", "5 min"))
     assert "includePrePost=true" in yahoo_stock_chart_url(ChartRequest("AMD", "i5", "5 min"))
@@ -729,10 +770,15 @@ def self_test() -> None:
     assert "range=1mo" in yahoo_stock_chart_url(ChartRequest("AMD", "i30", "30 min"))
     assert "range=6mo" in yahoo_stock_chart_url(ChartRequest("AMD", "h4", "4 hour"))
     assert is_stock_intraday(ChartRequest("AMD", "i1", "1 min"))
-    assert is_stock_yahoo_chart(ChartRequest("AMD", "d", "daily"))
+    assert is_stock_daily_quote_chart(ChartRequest("AMD", "d", "daily"))
+    assert not is_stock_daily_quote_chart(ChartRequest("ES", "d", "daily", futures=True))
+    assert not is_stock_daily_quote_chart(ChartRequest("AMD", "w", "weekly"))
+    assert not is_stock_yahoo_chart(ChartRequest("AMD", "d", "daily"))
     sample_rows = [(i, 1.0, 1.0, 1.0, float(i + 1), 1.0) for i in range(200)]
     assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "i15", "15 min"))) == 180
     assert len(_visible_indexes(sample_rows, ChartRequest("NQ", "i5", "5 min", futures=True))) == 140
+    assert len(_visible_indexes(sample_rows + sample_rows, ChartRequest("AMD", "d", "daily"))) == STOCK_DAILY_VISIBLE_BARS
+    assert _nice_linear_axis(14.92, 32.73) == (14, 34, [34, 32, 30, 28, 26, 24, 22, 20, 18, 16, 14])
     def et_epoch(hour: int, minute: int, day: int = 15) -> int:
         return int(dt.datetime(2026, 6, day, hour, minute, tzinfo=MARKET_TIME_ZONE).timestamp())
     today_rows = [
