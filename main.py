@@ -9,6 +9,7 @@ from charting import (
     ChartRequest,
     NoChartData,
     _safe_float,
+    _latest_quote_price_time,
     aggregate_yahoo_chart_data,
     _stock_previous_close,
     chart_title,
@@ -148,10 +149,7 @@ async def fetch_market_chart_data(session: aiohttp.ClientSession, request: Chart
     dates = result.get("timestamp") or []
     closes = raw_quote.get("close") or []
     valid_closes = [close for close in (_safe_float(value) for value in closes) if close is not None]
-    last = _safe_float(meta.get("regularMarketPrice")) or next(
-        (_safe_float(value) for value in reversed(closes) if _safe_float(value) is not None),
-        None,
-    )
+    last, last_time = _latest_quote_price_time(meta, dates, closes, request)
     prev = _stock_previous_close(meta, valid_closes, request)
     if request.timeframe != "d":
         prev = await fetch_daily_previous_close(session, request) or prev
@@ -166,7 +164,7 @@ async def fetch_market_chart_data(session: aiohttp.ClientSession, request: Chart
         "close": closes,
         "volume": raw_quote.get("volume") or [],
         "lastClose": last,
-        "lastTime": meta.get("regularMarketTime") or (dates[-1] if dates else None),
+        "lastTime": last_time,
         "prevClose": prev,
         "perfDayUsd": change,
         "perfDayPct": (change / prev * 100) if change is not None and prev else None,

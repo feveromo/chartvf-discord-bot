@@ -27,7 +27,7 @@ SMA_PERIODS = (20, 50, 200)
 SMA_LINE_WIDTH = 1
 SMA_COLORS = {20: (142, 43, 132), 50: (238, 126, 35), 200: (139, 111, 43)}
 FUTURES_INTRADAY_VISIBLE_BARS = 140
-STOCK_5M_START = dt.time(7, 0)
+STOCK_5M_START = dt.time(4, 0)
 STOCK_5M_END = dt.time(20, 0)
 REGULAR_SESSION_START = dt.time(9, 30)
 REGULAR_SESSION_END = dt.time(16, 0)
@@ -362,6 +362,36 @@ def _collapse_monthly_rows(rows: list[ChartRow]) -> list[ChartRow]:
     return collapsed
 
 
+def _source_interval_seconds(request: ChartRequest) -> int | None:
+    interval = YAHOO_TIMEFRAME_INTERVALS.get(request.timeframe)
+    if interval and interval.endswith("m") and interval[:-1].isdigit():
+        return int(interval[:-1]) * 60
+    if interval and interval.endswith("h") and interval[:-1].isdigit():
+        return int(interval[:-1]) * 60 * 60
+    return None
+
+
+def _drop_live_quote_row(rows: list[ChartRow], request: ChartRequest) -> list[ChartRow]:
+    interval = _source_interval_seconds(request)
+    if interval is None or len(rows) < 2:
+        return rows
+    epoch, open_, high, low, close, volume = rows[-1]
+    previous_epoch = rows[-2][0]
+    # ponytail: Yahoo appends a live quote row; it is not a finished candle.
+    if (
+        volume == 0
+        and open_ == high == low == close
+        and (
+            request.futures
+            or epoch % interval != 0
+            or epoch - previous_epoch < interval
+            or not _is_regular_stock_session(epoch)
+        )
+    ):
+        return rows[:-1]
+    return rows
+
+
 def _quote_rows(quote: dict[str, Any], request: ChartRequest) -> list[ChartRow]:
     dates = quote.get("date") or []
     opens = quote.get("open") or []
@@ -381,6 +411,7 @@ def _quote_rows(quote: dict[str, Any], request: ChartRequest) -> list[ChartRow]:
             continue
         v = _safe_float(volumes[i]) if i < len(volumes) else 0.0
         rows.append((int(dates[i]), o or 0.0, h or 0.0, l or 0.0, c or 0.0, v or 0.0))
+    rows = _drop_live_quote_row(rows, request)
     if request.timeframe == "m":
         rows = _collapse_monthly_rows(rows)
     if not rows:
@@ -426,13 +457,13 @@ def _stock_5m_today_indexes(rows: list[ChartRow], request: ChartRequest) -> list
     start = dt.datetime.combine(last_local.date(), STOCK_5M_START, MARKET_TIME_ZONE).timestamp()
     end = dt.datetime.combine(last_local.date(), STOCK_5M_END, MARKET_TIME_ZONE).timestamp()
     indexes = [i for i, row in enumerate(rows) if start <= row[0] <= end]
-    if len(indexes) >= 2:
+    if len(indexes) >= SPARSE_CHART_MIN_BARS:
         return indexes
     same_day = [
         i for i, row in enumerate(rows)
         if dt.datetime.fromtimestamp(row[0], dt.timezone.utc).astimezone(MARKET_TIME_ZONE).date() == last_local.date()
     ]
-    return same_day if len(same_day) >= 2 else None
+    return same_day if len(same_day) >= SPARSE_CHART_MIN_BARS else None
 
 
 def _visible_indexes(rows: list[ChartRow], request: ChartRequest) -> list[int]:
@@ -645,7 +676,7 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
         pad = (high - low) * 0.055
         low, high = low - pad, high + pad
         y_ticks = [high - step * (high - low) / 4 for step in range(5)]
-    vol_max = max((row[5] for row in rows), default=1) or 1
+    vol_max = max((row[5] for row in rows), default=0)
     vol_axis_high, vol_ticks = _volume_axis(vol_max, request)
 
     x_positions = _chart_x_positions(len(candles), left, plot_w)
@@ -793,7 +824,7 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
             ("   H", text), (_fmt(last[2]), candle_color),
             ("   L", text), (_fmt(last[3]), candle_color),
             ("   C", text), (_fmt(last[4]), candle_color),
-            ("   Vol", text), (_fmt_volume(last[5]), candle_color),
+            ("   Vol ", text), (_header_volume_label(last, request), candle_color),
         ]
         for part, color in header_parts:
             draw.text((header_x, 6), part, fill=color, font=header_font)
@@ -849,6 +880,16 @@ def _fmt_volume(value: Any) -> str:
     return f"{number:,.0f}"
 
 
+def _header_volume_label(row: ChartRow, request: ChartRequest) -> str:
+    if (
+        _source_interval_seconds(request) is not None
+        and row[5] == 0
+        and (request.futures or not _is_regular_stock_session(row[0]))
+    ):
+        return "n/a"
+    return _fmt_volume(row[5])
+
+
 def _quote_time_label(quote: dict[str, Any]) -> str | None:
     timestamp = _safe_float(quote.get("lastTime"))
     if timestamp is None:
@@ -868,6 +909,31 @@ def _stock_previous_close(meta: dict[str, Any], valid_closes: list[float], reque
         or _safe_float(meta.get("chartPreviousClose"))
         or (valid_closes[-2] if len(valid_closes) > 1 else None)
     )
+
+
+def _latest_quote_price_time(
+    meta: dict[str, Any],
+    dates: list[Any],
+    closes: list[Any],
+    request: ChartRequest,
+) -> tuple[float | None, int | None]:
+    latest_close = next(
+        (close for close in (_safe_float(value) for value in reversed(closes)) if close is not None),
+        None,
+    )
+    latest_time = int(dates[-1]) if dates else None
+    regular_price = _safe_float(meta.get("regularMarketPrice"))
+    regular_time_float = _safe_float(meta.get("regularMarketTime"))
+    regular_time = int(regular_time_float) if regular_time_float is not None else None
+    if (
+        not request.futures
+        and request.timeframe == "i5"
+        and latest_close is not None
+        and latest_time is not None
+        and (regular_time is None or latest_time > regular_time)
+    ):
+        return latest_close, latest_time
+    return (regular_price if regular_price is not None else latest_close), (regular_time or latest_time)
 
 
 def quote_description(quote: dict[str, Any]) -> str:
@@ -954,6 +1020,59 @@ def self_test() -> None:
     assert _volume_axis(688_100_000, ChartRequest("SOFI", "w", "weekly")) == (1_000_000_000, [500_000_000])
     def et_epoch(hour: int, minute: int, day: int = 15) -> int:
         return int(dt.datetime(2026, 6, day, hour, minute, tzinfo=MARKET_TIME_ZONE).timestamp())
+    assert _header_volume_label((et_epoch(7, 10), 1, 1, 1, 1, 0), ChartRequest("AMD", "i5", "5 min")) == "n/a"
+    assert _header_volume_label((et_epoch(10, 10), 1, 1, 1, 1, 0), ChartRequest("AMD", "i5", "5 min")) == "0"
+    assert _header_volume_label((et_epoch(7, 10), 1, 1, 1, 1, 10_500), ChartRequest("AMD", "i5", "5 min")) == "10.5K"
+    assert _header_volume_label((et_epoch(7, 10), 1, 2, 1, 2, 0), ChartRequest("ES", "i5", "5 min", futures=True)) == "n/a"
+    assert _header_volume_label((et_epoch(7, 10), 1, 2, 1, 2, 10_500), ChartRequest("ES", "i5", "5 min", futures=True)) == "10.5K"
+    live_quote_rows = {
+        "date": [et_epoch(7, 5), et_epoch(7, 7) + 15],
+        "open": [10, 12],
+        "high": [11, 12],
+        "low": [9, 12],
+        "close": [10.5, 12],
+        "volume": [100, 0],
+    }
+    assert _source_interval_seconds(ChartRequest("ES", "i10", "10 min", futures=True)) == 5 * 60
+    assert _source_interval_seconds(ChartRequest("ES", "h2", "2 hour", futures=True)) == 60 * 60
+    assert len(_quote_rows(live_quote_rows, ChartRequest("AMD", "i5", "5 min"))) == 1
+    assert len(_quote_rows(live_quote_rows, ChartRequest("ES", "i5", "5 min", futures=True))) == 1
+    assert len(_quote_rows({
+        "date": [et_epoch(10, 0), et_epoch(10, 5)],
+        "open": [10, 12],
+        "high": [10, 12],
+        "low": [10, 12],
+        "close": [10, 12],
+        "volume": [0, 0],
+    }, ChartRequest("AMD", "i5", "5 min"))) == 2
+    assert len(_quote_rows({
+        "date": [et_epoch(15, 30), et_epoch(16, 0)],
+        "open": [10, 12],
+        "high": [11, 12],
+        "low": [9, 12],
+        "close": [10.5, 12],
+        "volume": [100, 0],
+    }, ChartRequest("AMD", "h", "hourly"))) == 1
+    assert len(_quote_rows({
+        "date": [et_epoch(15, 59), et_epoch(16, 0)],
+        "open": [10, 12],
+        "high": [11, 12],
+        "low": [9, 12],
+        "close": [10.5, 12],
+        "volume": [100, 0],
+    }, ChartRequest("AMD", "i1", "1 min"))) == 1
+    assert _latest_quote_price_time(
+        {"regularMarketPrice": 754.83, "regularMarketTime": et_epoch(16, 0, 14)},
+        [et_epoch(4, 0)],
+        [754.54],
+        ChartRequest("SPY", "i5", "5 min"),
+    ) == (754.54, et_epoch(4, 0))
+    assert _latest_quote_price_time(
+        {"regularMarketPrice": 754.83, "regularMarketTime": et_epoch(9, 31)},
+        [et_epoch(9, 30)],
+        [754.54],
+        ChartRequest("SPY", "i5", "5 min"),
+    ) == (754.83, et_epoch(9, 31))
     today_rows = [
         (et_epoch(15, 55, 14), 1.0, 1.0, 1.0, 1.0, 1.0),
         (et_epoch(6, 55), 1.0, 1.0, 1.0, 2.0, 1.0),
@@ -962,7 +1081,22 @@ def self_test() -> None:
         (et_epoch(20, 0), 1.0, 1.0, 1.0, 5.0, 1.0),
         (et_epoch(20, 5), 1.0, 1.0, 1.0, 6.0, 1.0),
     ]
-    assert _visible_indexes(today_rows, ChartRequest("AMD", "i5", "5 min")) == [2, 3, 4]
+    assert _stock_5m_today_indexes(today_rows, ChartRequest("AMD", "i5", "5 min")) is None
+    dense_today_rows = [
+        (
+            int((dt.datetime(2026, 6, 15, 4, 0, tzinfo=MARKET_TIME_ZONE) + dt.timedelta(minutes=5 * i)).timestamp()),
+            1.0,
+            1.0,
+            1.0,
+            float(i + 1),
+            1.0,
+        )
+        for i in range(SPARSE_CHART_MIN_BARS)
+    ]
+    assert _visible_indexes(
+        [today_rows[0], *dense_today_rows],
+        ChartRequest("AMD", "i5", "5 min"),
+    ) == list(range(1, SPARSE_CHART_MIN_BARS + 1))
     wick_rows = [
         (et_epoch(7, 0), 100.0, 101.0, 80.0, 100.5, 1.0),
         (et_epoch(9, 30), 100.5, 100.8, 100.2, 100.6, 1.0),
