@@ -656,8 +656,30 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     def y_at(value: float) -> int:
         return price_bottom - round((value - low) * (price_bottom - price_top) / (high - low))
 
-    def price_y_at(value: float) -> int:
-        return max(price_top, min(price_bottom, y_at(value)))
+    def clip_price_segment(
+        start: tuple[int, int],
+        end: tuple[int, int],
+    ) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        x1, y1 = start
+        x2, y2 = end
+        if y1 == y2:
+            return (start, end) if price_top <= y1 <= price_bottom else None
+        if (y1 < price_top and y2 < price_top) or (y1 > price_bottom and y2 > price_bottom):
+            return None
+
+        def at_y(bound: int) -> tuple[int, int]:
+            ratio = (bound - y1) / (y2 - y1)
+            return round(x1 + (x2 - x1) * ratio), bound
+
+        if y1 < price_top:
+            start = at_y(price_top)
+        elif y1 > price_bottom:
+            start = at_y(price_bottom)
+        if y2 < price_top:
+            end = at_y(price_top)
+        elif y2 > price_bottom:
+            end = at_y(price_bottom)
+        return start, end
 
     def dashed(x1: int, y1: int, x2: int, y2: int) -> None:
         if y1 == y2:
@@ -741,9 +763,11 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
         for pos, i in enumerate(indexes):
             value = values[i]
             if value is not None:
-                points.append((x_at(pos), price_y_at(scaled(value))))
-        if len(points) > 1:
-            draw.line(points, fill=SMA_COLORS[period], width=SMA_LINE_WIDTH, joint="curve")
+                points.append((x_at(pos), y_at(scaled(value))))
+        for start, end in zip(points, points[1:]):
+            clipped = clip_price_segment(start, end)
+            if clipped is not None:
+                draw.line(clipped, fill=SMA_COLORS[period], width=SMA_LINE_WIDTH)
 
     last_idx = indexes[-1]
     last = all_rows[last_idx]
