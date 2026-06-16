@@ -156,6 +156,7 @@ async def fetch_market_chart_data(session: aiohttp.ClientSession, request: Chart
     change = (last - prev) if last is not None and prev else None
     quote = {
         "ticker": request.ticker,
+        "futures": request.futures,
         "name": meta.get("shortName") or meta.get("longName") or request.ticker,
         "date": dates,
         "open": raw_quote.get("open") or [],
@@ -197,7 +198,7 @@ async def send_chart(channel: discord.abc.Messageable, request: ChartRequest) ->
     embed = discord.Embed(
         title=chart_title(request),
         description=description,
-        color=0x2ECC71,
+        color=0x2ECC71 if (_safe_float(quote.get("perfDayUsd")) or 0.0) >= 0 else 0xFF5252,
     )
     embed.set_image(url=f"attachment://{filename}")
     await channel.send(embed=embed, file=file)

@@ -1,6 +1,0 @@
-{
-  "include": ["main.py", "charting.py"],
-  "venvPath": ".",
-  "venv": ".venv",
-  "pythonVersion": "3.14"
-}

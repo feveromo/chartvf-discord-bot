@@ -25,7 +25,6 @@ STOCK_WEEKLY_VISIBLE_BARS = 240
 STOCK_INTRADAY_VISIBLE_BARS = 180
 STOCK_MONTHLY_VISIBLE_BARS = 240
 SMA_PERIODS = (20, 50, 200)
-SMA_LINE_WIDTH = 1
 SMA_COLORS = {20: (142, 43, 132), 50: (238, 126, 35), 200: (139, 111, 43)}
 FUTURES_INTRADAY_VISIBLE_BARS = 140
 STOCK_5M_START = dt.time(4, 0)
@@ -178,6 +177,19 @@ STOCK_INTRADAY_UNSUPPORTED_MESSAGE = (
 # Futures must not use `;f`: that is Ford's stock ticker. Use `;fut ES`.
 FUTURES_TICKER_RE = re.compile(r"^[A-Z0-9]{1,8}$")
 FUTURES_ALIASES = {"fut", "future", "futures"}
+FUTURES_DISPLAY_NAMES = {
+    "ES": "E-mini S&P 500",
+    "MES": "Micro E-mini S&P 500",
+    "NQ": "E-mini Nasdaq-100",
+    "MNQ": "Micro E-mini Nasdaq-100",
+    "YM": "E-mini Dow",
+    "MYM": "Micro E-mini Dow",
+    "RTY": "E-mini Russell 2000",
+    "M2K": "Micro E-mini Russell 2000",
+    "CL": "Crude oil futures",
+    "GC": "Gold futures",
+    "6E": "Euro FX futures",
+}
 
 
 @dataclass(frozen=True)
@@ -312,12 +324,15 @@ def chart_title(request: ChartRequest) -> str:
     parts = [request.ticker]
     if request.date_range_label:
         parts.append(request.date_range_label)
-    parts += [request.timeframe_label, request.chart_type_label]
+    chart_type = "candles" if request.chart_type == "c" else request.chart_type_label
+    parts.append(f"{request.timeframe_label} {chart_type}")
     if request.scale != DEFAULT_SCALE:
         parts.append(request.scale_label)
     if request.theme != DEFAULT_THEME:
         parts.append(request.theme_label)
-    return " ".join(parts) + (" futures chart" if request.futures else " chart")
+    if request.futures:
+        parts.append("futures")
+    return " · ".join(parts)
 
 
 ChartRow = tuple[int, float, float, float, float, float]
@@ -905,7 +920,7 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
         for start, end in zip(points, points[1:]):
             clipped = clip_price_segment(start, end)
             if clipped is not None:
-                draw.line(clipped, fill=SMA_COLORS[period], width=SMA_LINE_WIDTH)
+                draw.line(clipped, fill=SMA_COLORS[period], width=1)
 
     last_idx = indexes[-1]
     last = all_rows[last_idx]
@@ -972,6 +987,13 @@ def _fmt(value: Any, suffix: str = "") -> str:
     if number is None:
         return "n/a"
     return f"{number:,.2f}{suffix}" if abs(number) < 1000 else f"{number:,.0f}{suffix}"
+
+
+def _fmt_signed(value: Any, suffix: str = "") -> str:
+    number = _safe_float(value)
+    if number is None:
+        return "n/a"
+    return ("+" if number > 0 else "") + _fmt(number, suffix)
 
 
 def _fmt_volume(value: Any) -> str:
@@ -1043,17 +1065,21 @@ def _latest_quote_price_time(
     return (regular_price if regular_price is not None else latest_close), (regular_time or latest_time)
 
 
+def _quote_display_name(quote: dict[str, Any]) -> str:
+    ticker = str(quote.get("ticker") or "").upper()
+    if quote.get("futures") and ticker in FUTURES_DISPLAY_NAMES:
+        return FUTURES_DISPLAY_NAMES[ticker]
+    return str(quote.get("name") or quote.get("ticker") or "quote")
+
+
 def quote_description(quote: dict[str, Any]) -> str:
-    name = quote.get("name") or quote.get("ticker") or "quote"
-    parts = [
-        str(name),
-        f"last `{_fmt(quote.get('lastClose'))}`",
-        f"change `{_fmt(quote.get('perfDayUsd'))}` (`{_fmt(quote.get('perfDayPct'), '%')}`)",
-    ]
+    metric_parts = [f"Last **{_fmt(quote.get('lastClose'))}**"]
+    if quote.get("perfDayUsd") is not None or quote.get("perfDayPct") is not None:
+        metric_parts.append(f"**{_fmt_signed(quote.get('perfDayUsd'))}** ({_fmt_signed(quote.get('perfDayPct'), '%')})")
     time_label = _quote_time_label(quote)
     if time_label:
-        parts.append(f"updated `{time_label}`")
-    return " · ".join(parts)
+        metric_parts.append(time_label)
+    return f"{_quote_display_name(quote)}\n" + " · ".join(metric_parts)
 
 
 def self_test() -> None:
@@ -1069,7 +1095,9 @@ def self_test() -> None:
     ranged = parse_chart_command(";aapl 1y")
     assert ranged is not None
     assert ranged.timeframe == "d" and ranged.date_range == "y1"
-    assert "updated `10:50 AM ET`" in quote_description({"ticker": "AMD", "lastClose": 548.54, "lastTime": 1781535058})
+    amd_description = quote_description({"ticker": "AMD", "lastClose": 548.54, "lastTime": 1781535058})
+    assert amd_description == "AMD\nLast **548.54** · 10:50 AM ET"
+    assert "`" not in amd_description
     assert _stock_previous_close(
         {"chartPreviousClose": 490.33, "previousClose": 511.57},
         [490.33, 551.24],
@@ -1131,6 +1159,16 @@ def self_test() -> None:
     assert _volume_scale_value(volume_rows, ChartRequest("AMD", "d", "daily")) == 10_000.0
     def et_epoch(hour: int, minute: int, day: int = 15) -> int:
         return int(dt.datetime(2026, 6, day, hour, minute, tzinfo=MARKET_TIME_ZONE).timestamp())
+    mes_description = quote_description({
+        "ticker": "MES",
+        "futures": True,
+        "name": "MICRO E-MINI S&P 500 INDEX FUTU",
+        "lastClose": 7588,
+        "perfDayUsd": 26.5,
+        "perfDayPct": 0.35,
+        "lastTime": et_epoch(18, 2),
+    })
+    assert mes_description == "Micro E-mini S&P 500\nLast **7,588** · **+26.50** (+0.35%) · 6:02 PM ET"
     assert _header_volume_label((et_epoch(7, 10), 1, 1, 1, 1, 0), ChartRequest("AMD", "i5", "5 min")) == "n/a"
     assert _header_volume_label((et_epoch(10, 10), 1, 1, 1, 1, 0), ChartRequest("AMD", "i5", "5 min")) == "0"
     assert _header_volume_label((et_epoch(7, 10), 1, 1, 1, 1, 10_500), ChartRequest("AMD", "i5", "5 min")) == "10.5K"
@@ -1263,7 +1301,7 @@ def self_test() -> None:
     fut_req = parse_chart_command(";futures gc 1y")
     assert fut_req is not None
     assert fut_req.futures and fut_req.ticker == "GC" and fut_req.date_range == "y1"
-    assert chart_title(ChartRequest("ES", futures=True)).endswith("futures chart")
+    assert chart_title(ChartRequest("ES", futures=True)) == "ES · daily candles · futures"
     assert "ES=F" in yahoo_chart_url(ChartRequest("ES", futures=True))
     assert "interval=1m" in yahoo_chart_url(ChartRequest("ES", "i3", "3 min", futures=True))
     assert "interval=5m" in yahoo_chart_url(ChartRequest("ES", "i10", "10 min", futures=True))
