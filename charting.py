@@ -92,7 +92,6 @@ DATE_RANGES = {
     "max": ("max", "max"),
     "all": ("max", "max"),
 }
-INTRADAY_ALIASES = set(FUTURES_TIMEFRAMES)
 STOCK_INTRADAY_INTERVALS = {
     "i1": "1m",
     "i2": "2m",
@@ -129,21 +128,6 @@ YAHOO_INTRADAY_RANGES = {
     "h2": "1mo",
     "h4": "6mo",
 }
-YAHOO_DATE_RANGES = {
-    "m1": "1mo",
-    "m3": "3mo",
-    "m6": "6mo",
-    "ytd": "ytd",
-    "y1": "1y",
-    "y2": "2y",
-    "y5": "5y",
-    "max": "max",
-}
-YAHOO_DEFAULT_RANGES = {
-    "d": "2y",
-    "w": "10y",
-    "m": "max",
-}
 DAILY_SMA_FETCH_RANGES = {
     "": "2y",
     "m1": "1y",
@@ -172,6 +156,18 @@ YAHOO_AGGREGATE_SECONDS = {
     "h2": 2 * 60 * 60,
 }
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,14}$")
+YAHOO_SYMBOL_ALIASES = {
+    "SPX": "^GSPC",
+    "NDX": "^NDX",
+    "DJX": "^DJI",
+    "DJI": "^DJI",
+    "DJIA": "^DJI",
+    "RUT": "^RUT",
+    "RUI": "^RUI",
+    "VIX": "^VIX",
+    "IXIC": "^IXIC",
+    "OEX": "^OEX",
+}
 STOCK_INTRADAY_UNSUPPORTED_MESSAGE = (
     "Stock intraday supports `1`, `2`, `5`, `15`, `30`, `60`, and `4h` "
     "via market chart data. Use `d`, `w`, or `m` for higher timeframes."
@@ -259,8 +255,6 @@ def parse_chart_command(content: str) -> ChartRequest | None:
         elif option in DATE_RANGES:
             date_range, date_range_label = DATE_RANGES[option]
             date_range_explicit = True
-        elif option in INTRADAY_ALIASES:
-            raise ValueError(STOCK_INTRADAY_UNSUPPORTED_MESSAGE)
         else:
             raise ValueError(
                 f"Unknown chart option `{raw_option}`. Use `d`, `w`, `m`, stock intraday `1`, `2`, `5`, `15`, `30`, `60`, `4h`, `candle`, `line`, `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`, `dark`, `light`, `linear`, `log`, or `percent`. Futures also support `3`, `10`, and `2h`."
@@ -278,7 +272,7 @@ def parse_chart_command(content: str) -> ChartRequest | None:
 def yahoo_chart_symbol(request: ChartRequest) -> str:
     if request.futures:
         return f"{request.ticker}=F"
-    return request.ticker
+    return YAHOO_SYMBOL_ALIASES.get(request.ticker, request.ticker)
 
 
 def _yahoo_chart_range(request: ChartRequest) -> str:
@@ -290,9 +284,7 @@ def _yahoo_chart_range(request: ChartRequest) -> str:
         return WEEKLY_SMA_FETCH_RANGES.get(request.date_range, "10y")
     if request.timeframe == "m":
         return "max"
-    if request.date_range:
-        return YAHOO_DATE_RANGES.get(request.date_range, "1y")
-    return YAHOO_DEFAULT_RANGES.get(request.timeframe, "1y")
+    raise ValueError(f"Chart data does not support `{request.timeframe_label}` charts.")
 
 
 def yahoo_chart_url(request: ChartRequest) -> str:
@@ -914,6 +906,8 @@ def self_test() -> None:
     assert "range=1mo" in yahoo_chart_url(ChartRequest("AMD", "i30", "30 min"))
     assert "range=6mo" in yahoo_chart_url(ChartRequest("AMD", "h4", "4 hour"))
     assert "range=2y" in yahoo_chart_url(ChartRequest("AMD", "d", "daily"))
+    for ticker, yahoo_symbol in YAHOO_SYMBOL_ALIASES.items():
+        assert yahoo_symbol in yahoo_chart_url(ChartRequest(ticker, "d", "daily"))
     assert "range=2y" in yahoo_chart_url(ChartRequest("AMD", "d", "daily", date_range="y1"))
     assert "interval=1wk" in yahoo_chart_url(ChartRequest("AMD", "w", "weekly"))
     assert "range=10y" in yahoo_chart_url(ChartRequest("AMD", "w", "weekly"))

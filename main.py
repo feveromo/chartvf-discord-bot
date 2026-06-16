@@ -46,6 +46,7 @@ HELP_TEXT = """**ChartVF chart bot**
 `;fut ES 15` → E-mini S&P 15-minute chart
 `;fut CL w line` → crude oil weekly line
 `;futures GC 1y` → gold 1-year chart
+Indexes: `;SPX`, `;NDX`, `;DJX`/`;DJI`/`;DJIA`, `;RUT`, `;RUI`, `;VIX`, `;IXIC`, `;OEX`
 
 **Options** (same for stocks and futures)
 Timeframes: stocks support `d`, `w`, `m`, plus intraday `1`, `2`, `5`, `15`, `30`, `60`, `4h`; futures also support `3`, `10`, `2h`
