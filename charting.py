@@ -34,6 +34,7 @@ REGULAR_SESSION_END = dt.time(16, 0)
 EXTENDED_WICK_PCT_LIMIT = 0.004
 EXTENDED_WICK_RANGE_MULTIPLE = 8.0
 SPARSE_CHART_MIN_BARS = 24
+INTRADAY_VOLUME_SCALE_PERCENTILE = 0.90
 
 TIMEFRAMES = {
     "d": ("d", "daily"),
@@ -496,6 +497,46 @@ def _is_regular_stock_session(epoch: int) -> bool:
     return REGULAR_SESSION_START <= local_time < REGULAR_SESSION_END
 
 
+def _stock_extended_session_key(epoch: int) -> tuple[str, dt.date] | None:
+    local = dt.datetime.fromtimestamp(epoch, dt.timezone.utc).astimezone(MARKET_TIME_ZONE)
+    local_time = local.time()
+    if STOCK_5M_START <= local_time < REGULAR_SESSION_START:
+        return "pre", local.date()
+    if REGULAR_SESSION_END <= local_time <= STOCK_5M_END:
+        return "after", local.date()
+    return None
+
+
+def _stock_extended_session_bands(
+    rows: list[ChartRow],
+    x_positions: list[int],
+    left: int,
+    plot_right: int,
+) -> list[tuple[int, int, str]]:
+    bands: list[tuple[int, int, str]] = []
+    active: tuple[str, dt.date] | None = None
+    start_pos = 0
+
+    def append_band(start: int, end: int, kind: str) -> None:
+        band_left = left if start == 0 else (x_positions[start - 1] + x_positions[start]) // 2
+        band_right = plot_right if end == len(x_positions) - 1 else (x_positions[end] + x_positions[end + 1]) // 2
+        if band_right > band_left:
+            bands.append((band_left, band_right, kind))
+
+    for pos, row in enumerate(rows):
+        key = _stock_extended_session_key(row[0])
+        if key == active:
+            continue
+        if active is not None:
+            append_band(start_pos, pos - 1, active[0])
+        active = key
+        start_pos = pos
+
+    if active is not None:
+        append_band(start_pos, len(rows) - 1, active[0])
+    return bands
+
+
 def _clean_stock_5m_wicks(rows: list[ChartRow], request: ChartRequest) -> list[ChartRow]:
     if request.futures or request.timeframe != "i5":
         return rows
@@ -591,6 +632,16 @@ def _volume_axis(value: float, request: ChartRequest) -> tuple[float, list[float
     return high, ticks
 
 
+def _volume_scale_value(rows: list[ChartRow], request: ChartRequest) -> float:
+    values = sorted(row[5] for row in rows if row[5] > 0)
+    if not values:
+        return 0
+    if request.timeframe.startswith(("i", "h")) and len(values) >= SPARSE_CHART_MIN_BARS:
+        index = math.ceil(len(values) * INTRADAY_VOLUME_SCALE_PERCENTILE) - 1
+        return values[max(0, min(index, len(values) - 1))]
+    return values[-1]
+
+
 def _date_label(epoch: int, intraday: bool, span: int) -> str:
     stamp = dt.datetime.fromtimestamp(epoch, dt.timezone.utc)
     if intraday:
@@ -645,7 +696,8 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     volume_h, gap = 68, 8
     vol_top, vol_bottom = height - bottom - volume_h, height - bottom
     price_top, price_bottom = top, vol_top - gap
-    plot_w = width - left - right
+    plot_right = width - right
+    plot_w = plot_right - left
     all_rows = _clean_stock_5m_wicks(_quote_rows(quote, request), request)
     indexes = _visible_indexes(all_rows, request)
     rows = [all_rows[i] for i in indexes]
@@ -676,10 +728,21 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
         pad = (high - low) * 0.055
         low, high = low - pad, high + pad
         y_ticks = [high - step * (high - low) / 4 for step in range(5)]
-    vol_max = max((row[5] for row in rows), default=0)
-    vol_axis_high, vol_ticks = _volume_axis(vol_max, request)
+    vol_axis_high, vol_ticks = _volume_axis(_volume_scale_value(rows, request), request)
 
     x_positions = _chart_x_positions(len(candles), left, plot_w)
+    session_bands = (
+        _stock_extended_session_bands(rows, x_positions, left, plot_right)
+        if intraday and not request.futures
+        else []
+    )
+    session_fills = {
+        "pre": (34, 42, 58) if dark else (236, 244, 252),
+        "after": (45, 39, 53) if dark else (250, 240, 247),
+    }
+    session_boundary = (61, 76, 101) if dark else (184, 195, 211)
+    session_text = (108, 126, 158) if dark else (112, 124, 143)
+    session_labels = {"pre": "PRE", "after": "AH"}
 
     def x_at(i: int) -> int:
         return x_positions[i]
@@ -724,14 +787,17 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
                 draw.line((x1, y, x2, min(y + 8, y2)), fill=grid, width=1)
                 y += 14
 
+    for x1, x2, kind in session_bands:
+        draw.rectangle((x1, price_top, x2, vol_bottom), fill=session_fills[kind])
+
     for value in y_ticks:
         y = y_at(value)
-        dashed(left, y, width - right, y)
+        dashed(left, y, plot_right, y)
         if not (
             (request.scale == "linear" and low == 0 and value == 0)
             or (period_shell and value == high)
         ):
-            draw.text((width - right + 8, y - 11), _axis_label(value, request), fill=text, font=axis_font)
+            draw.text((plot_right + 8, y - 11), _axis_label(value, request), fill=text, font=axis_font)
     x_ticks: list[tuple[int, str]]
     if request.timeframe == "m" and not intraday:
         x_ticks = [
@@ -770,15 +836,26 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
                 continue
             drawn_sparse_labels.add(label)
         label_w = draw.textbbox((0, 0), label, font=axis_font)[2]
-        draw.text((max(0, min(width - right - label_w, x - label_w // 2)), vol_bottom + 6), label, fill=text, font=axis_font)
-    draw.line((left, price_bottom, width - right, price_bottom), fill=grid, width=1)
+        draw.text((max(0, min(plot_right - label_w, x - label_w // 2)), vol_bottom + 6), label, fill=text, font=axis_font)
+    draw.line((left, price_bottom, plot_right, price_bottom), fill=grid, width=1)
+
+    for x1, x2, kind in session_bands:
+        if x1 > left:
+            draw.line((x1, price_top, x1, vol_bottom), fill=session_boundary, width=1)
+        if x2 < plot_right:
+            draw.line((x2, price_top, x2, vol_bottom), fill=session_boundary, width=1)
+        label = session_labels[kind]
+        label_w = draw.textbbox((0, 0), label, font=small_font)[2]
+        if x2 - x1 >= label_w + 12:
+            label_x = max(x1 + 4, min(x2 - label_w - 4, x1 + (x2 - x1 - label_w) // 2))
+            draw.text((label_x, price_top + 4), label, fill=session_text, font=small_font)
 
     candle_w = max(2, min(8, int(plot_w / max(len(candles), 1) * 0.58)))
     close_points: list[tuple[int, int]] = []
     for pos, (_, _, o, h, l, c, v) in enumerate(candles):
         x = x_at(pos)
         color = up if c >= o else down
-        vh = round((v / vol_axis_high) * (vol_bottom - vol_top))
+        vh = min(vol_bottom - vol_top, round((v / vol_axis_high) * (vol_bottom - vol_top)))
         draw.rectangle((x - candle_w // 2, vol_bottom - vh, x + candle_w // 2, vol_bottom), fill=vol_up if c >= o else vol_down)
         if request.chart_type == "l":
             close_points.append((x, y_at(c)))
@@ -1018,6 +1095,10 @@ def self_test() -> None:
     assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "m", "monthly"))) == STOCK_MONTHLY_VISIBLE_BARS
     assert _nice_linear_axis(14.92, 32.73) == (14, 34, [34, 32, 30, 28, 26, 24, 22, 20, 18, 16, 14])
     assert _volume_axis(688_100_000, ChartRequest("SOFI", "w", "weekly")) == (1_000_000_000, [500_000_000])
+    volume_rows = [(i, 1.0, 1.0, 1.0, 1.0, float(i + 1)) for i in range(100)]
+    volume_rows.append((101, 1.0, 1.0, 1.0, 1.0, 10_000.0))
+    assert _volume_scale_value(volume_rows, ChartRequest("AMD", "i5", "5 min")) == 91.0
+    assert _volume_scale_value(volume_rows, ChartRequest("AMD", "d", "daily")) == 10_000.0
     def et_epoch(hour: int, minute: int, day: int = 15) -> int:
         return int(dt.datetime(2026, 6, day, hour, minute, tzinfo=MARKET_TIME_ZONE).timestamp())
     assert _header_volume_label((et_epoch(7, 10), 1, 1, 1, 1, 0), ChartRequest("AMD", "i5", "5 min")) == "n/a"
@@ -1025,6 +1106,19 @@ def self_test() -> None:
     assert _header_volume_label((et_epoch(7, 10), 1, 1, 1, 1, 10_500), ChartRequest("AMD", "i5", "5 min")) == "10.5K"
     assert _header_volume_label((et_epoch(7, 10), 1, 2, 1, 2, 0), ChartRequest("ES", "i5", "5 min", futures=True)) == "n/a"
     assert _header_volume_label((et_epoch(7, 10), 1, 2, 1, 2, 10_500), ChartRequest("ES", "i5", "5 min", futures=True)) == "10.5K"
+    assert _stock_extended_session_key(et_epoch(7, 10)) == ("pre", dt.date(2026, 6, 15))
+    assert _stock_extended_session_key(et_epoch(10, 10)) is None
+    assert _stock_extended_session_key(et_epoch(16, 0)) == ("after", dt.date(2026, 6, 15))
+    session_rows = [
+        (et_epoch(4, 0), 1.0, 1.0, 1.0, 1.0, 1.0),
+        (et_epoch(9, 30), 1.0, 1.0, 1.0, 1.0, 1.0),
+        (et_epoch(16, 0), 1.0, 1.0, 1.0, 1.0, 1.0),
+        (et_epoch(20, 0), 1.0, 1.0, 1.0, 1.0, 1.0),
+    ]
+    assert _stock_extended_session_bands(session_rows, [10, 20, 30, 40], 10, 40) == [
+        (10, 15, "pre"),
+        (25, 40, "after"),
+    ]
     live_quote_rows = {
         "date": [et_epoch(7, 5), et_epoch(7, 7) + 15],
         "open": [10, 12],
