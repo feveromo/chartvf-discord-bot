@@ -808,13 +808,16 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     def x_at(i: int) -> int:
         return x_positions[i]
 
+    def price_y_at(value: float) -> float:
+        return price_bottom - (value - low) * (price_bottom - price_top) / (high - low)
+
     def y_at(value: float) -> int:
-        return price_bottom - round((value - low) * (price_bottom - price_top) / (high - low))
+        return round(price_y_at(value))
 
     def clip_price_segment(
-        start: tuple[int, int],
-        end: tuple[int, int],
-    ) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        start: tuple[float, float],
+        end: tuple[float, float],
+    ) -> tuple[tuple[float, float], tuple[float, float]] | None:
         x1, y1 = start
         x2, y2 = end
         if y1 == y2:
@@ -822,9 +825,9 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
         if (y1 < price_top and y2 < price_top) or (y1 > price_bottom and y2 > price_bottom):
             return None
 
-        def at_y(bound: int) -> tuple[int, int]:
+        def at_y(bound: int) -> tuple[float, float]:
             ratio = (bound - y1) / (y2 - y1)
-            return round(x1 + (x2 - x1) * ratio), bound
+            return x1 + (x2 - x1) * ratio, float(bound)
 
         if y1 < price_top:
             start = at_y(price_top)
@@ -933,16 +936,32 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     if close_points:
         draw.line(close_points, fill=line_color, width=2, joint="curve")
 
+    sma_scale = 4
+    sma_masks = {period: Image.new("L", (width * sma_scale, height * sma_scale), 0) for period in SMA_PERIODS}
+    sma_draws = {period: ImageDraw.Draw(mask) for period, mask in sma_masks.items()}
     for period, values in smas.items():
-        points: list[tuple[int, int]] = []
+        points: list[tuple[float, float]] = []
         for pos, i in enumerate(indexes):
             value = values[i]
             if value is not None:
-                points.append((x_at(pos), y_at(scaled(value))))
+                points.append((float(x_at(pos)), price_y_at(scaled(value))))
         for start, end in zip(points, points[1:]):
             clipped = clip_price_segment(start, end)
             if clipped is not None:
-                draw.line(clipped, fill=SMA_COLORS[period], width=2)
+                (x1, y1), (x2, y2) = clipped
+                sma_draws[period].line(
+                    (
+                        round(x1 * sma_scale),
+                        round(y1 * sma_scale),
+                        round(x2 * sma_scale),
+                        round(y2 * sma_scale),
+                    ),
+                    fill=255,
+                    width=2 * sma_scale,
+                )
+    for period, mask in sma_masks.items():
+        mask = mask.resize((width, height), Image.Resampling.LANCZOS)
+        image.paste(SMA_COLORS[period], (0, 0, width, height), mask)
 
     last_idx = indexes[-1]
     last = all_rows[last_idx]
@@ -1359,5 +1378,26 @@ def self_test() -> None:
         "volume": [100, 150, 120],
     }, ChartRequest("ES", futures=True))
     assert sample_png.startswith(b"\x89PNG") and len(sample_png) > 1000
+    smooth_close = [100.0 + math.sin(i / 4) * 3.0 + i * 0.03 for i in range(80)]
+    smooth_png = render_price_chart_png({
+        "ticker": "SMA",
+        "date": [1_700_000_000 + i * 86400 for i in range(len(smooth_close))],
+        "open": smooth_close,
+        "high": [value + 0.4 for value in smooth_close],
+        "low": [value - 0.4 for value in smooth_close],
+        "close": smooth_close,
+        "volume": [100.0] * len(smooth_close),
+    }, ChartRequest("SMA", "d", "daily"))
+    from PIL import Image
+    smooth_image = Image.open(io.BytesIO(smooth_png)).convert("RGB")
+    crop = smooth_image.crop((60, 34, DEFAULT_WIDTH * DEFAULT_SCALE_FACTOR - CHART_RIGHT_MARGIN, 370))
+    crop_bytes = crop.tobytes()
+    edge_pixels = 0
+    sma20 = SMA_COLORS[20]
+    for i in range(0, len(crop_bytes), 3):
+        rgb = crop_bytes[i:i + 3]
+        distance = sum(abs(rgb[channel] - sma20[channel]) for channel in range(3))
+        edge_pixels += 0 < distance <= 90
+    assert edge_pixels > 0
     aapl_req = parse_chart_command(";aapl")
     assert aapl_req is not None and not aapl_req.futures and aapl_req.timeframe == "i5"
