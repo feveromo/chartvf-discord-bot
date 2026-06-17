@@ -41,7 +41,7 @@ STOCK_5M_END = dt.time(20, 0)
 REGULAR_SESSION_START = dt.time(9, 30)
 REGULAR_SESSION_END = dt.time(16, 0)
 EXTENDED_WICK_PCT_LIMIT = 0.004
-EXTENDED_WICK_RANGE_MULTIPLE = 8.0
+EXTENDED_WICK_RANGE_MULTIPLE = 3.0
 SPARSE_CHART_MIN_BARS = 24
 
 TIMEFRAMES = {
@@ -135,7 +135,7 @@ YAHOO_INTRADAY_RANGES = {
     "i30": "1mo",
     "h": "1mo",
     "h2": "3mo",
-    "h4": "6mo",
+    "h4": "1y",
 }
 DAILY_SMA_FETCH_RANGES = {
     "": "2y",
@@ -595,8 +595,8 @@ def _futures_globex_session_bands(
     return _extended_session_bands(rows, x_positions, left, plot_right, _futures_globex_session_key)
 
 
-def _clean_stock_5m_wicks(rows: list[ChartRow], request: ChartRequest) -> list[ChartRow]:
-    if request.futures or request.timeframe != "i5":
+def _clean_stock_extended_wicks(rows: list[ChartRow], request: ChartRequest) -> list[ChartRow]:
+    if request.futures or not request.timeframe.startswith(("i", "h")):
         return rows
     regular_ranges = sorted(
         max(0.0, row[2] - row[3])
@@ -758,7 +758,7 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     price_top, price_bottom = top, vol_top - gap
     plot_right = width - right
     plot_w = plot_right - left
-    all_rows = _clean_stock_5m_wicks(_quote_rows(quote, request), request)
+    all_rows = _clean_stock_extended_wicks(_quote_rows(quote, request), request)
     indexes = _visible_indexes(all_rows, request)
     rows = [all_rows[i] for i in indexes]
     base = rows[0][4]
@@ -1181,7 +1181,8 @@ def self_test() -> None:
     assert "includePrePost=true" in yahoo_chart_url(ChartRequest("AMD", "i5", "5 min"))
     assert "includePrePost=false" in yahoo_chart_url(ChartRequest("AMD", "i15", "15 min"))
     assert "range=1mo" in yahoo_chart_url(ChartRequest("AMD", "i30", "30 min"))
-    assert "range=6mo" in yahoo_chart_url(ChartRequest("AMD", "h4", "4 hour"))
+    assert "range=1y" in yahoo_chart_url(ChartRequest("AMD", "h4", "4 hour"))
+    assert "includePrePost=false" in yahoo_chart_url(ChartRequest("AMD", "h4", "4 hour"))
     assert "range=3mo" in yahoo_chart_url(ChartRequest("ES", "h2", "2 hour", futures=True))
     assert "range=2y" in yahoo_chart_url(ChartRequest("AMD", "d", "daily"))
     for ticker, yahoo_symbol in YAHOO_SYMBOL_ALIASES.items():
@@ -1193,6 +1194,10 @@ def self_test() -> None:
     assert "interval=1mo" in monthly_url and "period1=0" in monthly_url and "period2=" in monthly_url
     sample_rows = [(i, 1.0, 1.0, 1.0, float(i + 1), 1.0) for i in range(300)]
     assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "i15", "15 min"))) == STOCK_INTRADAY_VISIBLE_BARS
+    h4_rows = [(i, 1.0, 1.0, 1.0, float(i + 1), 1.0) for i in range(500)]
+    h4_indexes = _visible_indexes(h4_rows, ChartRequest("AMD", "h4", "4 hour"))
+    assert len(h4_indexes) == STOCK_INTRADAY_VISIBLE_BARS
+    assert h4_indexes[0] >= SMA_PERIODS[-1] - 1
     assert len(_visible_indexes(sample_rows, ChartRequest("NQ", "i5", "5 min", futures=True))) == FUTURES_INTRADAY_VISIBLE_BARS
     assert len(_visible_indexes(sample_rows + sample_rows, ChartRequest("AMD", "d", "daily"))) == STOCK_DAILY_VISIBLE_BARS
     assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "w", "weekly"))) == STOCK_WEEKLY_VISIBLE_BARS
@@ -1320,11 +1325,15 @@ def self_test() -> None:
         (et_epoch(16, 0), 100.8, 130.0, 100.6, 100.9, 1.0),
         (et_epoch(17, 0), 100.9, 130.0, 100.7, 101.0, 1.0),
     ]
-    cleaned = _clean_stock_5m_wicks(wick_rows, ChartRequest("AMD", "i5", "5 min"))
+    cleaned = _clean_stock_extended_wicks(wick_rows, ChartRequest("AMD", "i5", "5 min"))
     assert cleaned[0][3] == 100.0
     assert cleaned[3][3] == 80.0
     assert cleaned[4][2] == 100.9
     assert cleaned[5][2] == 101.0
+    h4_cleaned = _clean_stock_extended_wicks(wick_rows, ChartRequest("AMD", "h4", "4 hour"))
+    assert h4_cleaned[0][3] == 100.0
+    assert h4_cleaned[3][3] == 80.0
+    assert h4_cleaned[4][2] == 100.9
     sparse_positions = _chart_x_positions(2, 60, 776)
     assert sparse_positions[0] > 760 and sparse_positions[1] == 835
     assert _date_label(1781536808, True, 3600) == "11:20"
