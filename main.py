@@ -30,7 +30,7 @@ import aiohttp
 import discord
 from dotenv import load_dotenv
 
-HELP_TEXT = """**ChartVF chart bot**
+HELP_TEXT = """**ChartVF**
 
 **Syntax**
 `;TICKER [timeframe] [type] [range] [theme] [scale]` — stocks

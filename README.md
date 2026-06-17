@@ -1,6 +1,6 @@
-# ChartVF Discord Bot
+# ChartVF
 
-A tiny Discord bot that posts locally rendered stock and futures charts. Nothing else.
+A tiny Discord chart bot for stocks and futures. It renders local PNGs from market chart data. Nothing else.
 
 ## Setup
 
