@@ -43,7 +43,6 @@ REGULAR_SESSION_END = dt.time(16, 0)
 EXTENDED_WICK_PCT_LIMIT = 0.004
 EXTENDED_WICK_RANGE_MULTIPLE = 8.0
 SPARSE_CHART_MIN_BARS = 24
-INTRADAY_VOLUME_SCALE_PERCENTILE = 0.90
 
 TIMEFRAMES = {
     "d": ("d", "daily"),
@@ -693,12 +692,7 @@ def _volume_axis(value: float, request: ChartRequest) -> tuple[float, list[float
 
 def _volume_scale_value(rows: list[ChartRow], request: ChartRequest) -> float:
     values = sorted(row[5] for row in rows if row[5] > 0)
-    if not values:
-        return 0
-    if request.timeframe.startswith(("i", "h")) and len(values) >= SPARSE_CHART_MIN_BARS:
-        index = math.ceil(len(values) * INTRADAY_VOLUME_SCALE_PERCENTILE) - 1
-        return values[max(0, min(index, len(values) - 1))]
-    return values[-1]
+    return values[-1] if values else 0
 
 
 def _date_label(epoch: int, intraday: bool, span: int) -> str:
@@ -948,7 +942,7 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
         for start, end in zip(points, points[1:]):
             clipped = clip_price_segment(start, end)
             if clipped is not None:
-                draw.line(clipped, fill=SMA_COLORS[period], width=1)
+                draw.line(clipped, fill=SMA_COLORS[period], width=2)
 
     last_idx = indexes[-1]
     last = all_rows[last_idx]
@@ -1187,7 +1181,7 @@ def self_test() -> None:
     assert _volume_axis(688_100_000, ChartRequest("SOFI", "w", "weekly")) == (1_000_000_000, [500_000_000])
     volume_rows = [(i, 1.0, 1.0, 1.0, 1.0, float(i + 1)) for i in range(100)]
     volume_rows.append((101, 1.0, 1.0, 1.0, 1.0, 10_000.0))
-    assert _volume_scale_value(volume_rows, ChartRequest("AMD", "i5", "5 min")) == 91.0
+    assert _volume_scale_value(volume_rows, ChartRequest("AMD", "i5", "5 min")) == 10_000.0
     assert _volume_scale_value(volume_rows, ChartRequest("AMD", "d", "daily")) == 10_000.0
     def et_epoch(hour: int, minute: int, day: int = 15) -> int:
         return int(dt.datetime(2026, 6, day, hour, minute, tzinfo=MARKET_TIME_ZONE).timestamp())
