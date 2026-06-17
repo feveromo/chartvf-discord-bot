@@ -42,7 +42,7 @@ HELP_TEXT = """**ChartVF chart bot**
 `;AMD 1` → AMD 1-minute intraday chart
 `;QQQ w line` → weekly line chart
 `;LULU 1y` → 1-year chart
-`;AAPL light log` → light theme, log scale
+`;AAPL dark log` → dark theme, log scale
 `;fut ES` → E-mini S&P daily candle
 `;fut ES 15` → E-mini S&P 15-minute chart
 `;fut CL w line` → crude oil weekly line

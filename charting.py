@@ -13,7 +13,7 @@ DEFAULT_TIMEFRAME = "d"
 DEFAULT_STOCK_TIMEFRAME = "i5"
 DEFAULT_STOCK_TIMEFRAME_LABEL = "5 min"
 DEFAULT_CHART_TYPE = "c"
-DEFAULT_THEME = "dark"
+DEFAULT_THEME = "light"
 DEFAULT_SCALE = "linear"
 DEFAULT_SCALE_FACTOR = 2
 DEFAULT_WIDTH = 466
@@ -200,7 +200,7 @@ class ChartRequest:
     chart_type: str = DEFAULT_CHART_TYPE
     chart_type_label: str = "candle"
     theme: str = DEFAULT_THEME
-    theme_label: str = "dark"
+    theme_label: str = "light"
     scale: str = DEFAULT_SCALE
     scale_label: str = "linear"
     date_range: str = ""
@@ -231,7 +231,7 @@ def parse_chart_command(content: str) -> ChartRequest | None:
     elif parts[0].lower() in {"chart", "charts"}:
         parts = parts[1:]
         if not parts:
-            raise ValueError("Usage: `;AAPL`, `;AAPL w`, or `;AAPL m line light log`")
+            raise ValueError("Usage: `;AAPL`, `;AAPL w`, or `;AAPL m line dark log`")
 
     ticker = parts[0].upper().replace(".", "-")
     if is_futures:
@@ -1089,8 +1089,8 @@ def self_test() -> None:
     assert parse_chart_command(";aapl") == ChartRequest("AAPL", "i5", "5 min")
     assert parse_chart_command(";aapl d") == ChartRequest("AAPL", "d", "daily")
     assert parse_chart_command(";brk.b w line") == ChartRequest("BRK-B", "w", "weekly", "l", "line")
-    assert parse_chart_command(";aapl m line light log") == ChartRequest(
-        "AAPL", "m", "monthly", "l", "line", "light", "light", "logarithmic", "log"
+    assert parse_chart_command(";aapl m line dark log") == ChartRequest(
+        "AAPL", "m", "monthly", "l", "line", "dark", "dark", "logarithmic", "log"
     )
     ranged = parse_chart_command(";aapl 1y")
     assert ranged is not None

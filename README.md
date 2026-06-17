@@ -36,7 +36,7 @@ This bot is a long-running Discord worker, not an HTTP web service, so it does n
 ;AMD 1               AMD 1-minute intraday chart
 ;AAPL w              weekly candle chart
 ;AAPL m line         monthly line chart
-;AAPL light log      light theme, log scale
+;AAPL dark log       dark theme, log scale
 ;AAPL percent        percent scale
 ;AAPL 1y             1-year chart
 ;AAPL w 5y           5-year weekly chart
