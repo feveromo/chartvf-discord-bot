@@ -134,7 +134,7 @@ YAHOO_INTRADAY_RANGES = {
     "i15": "5d",
     "i30": "1mo",
     "h": "1mo",
-    "h2": "1mo",
+    "h2": "3mo",
     "h4": "6mo",
 }
 DAILY_SMA_FETCH_RANGES = {
@@ -1163,6 +1163,7 @@ def self_test() -> None:
     assert "includePrePost=false" in yahoo_chart_url(ChartRequest("AMD", "i15", "15 min"))
     assert "range=1mo" in yahoo_chart_url(ChartRequest("AMD", "i30", "30 min"))
     assert "range=6mo" in yahoo_chart_url(ChartRequest("AMD", "h4", "4 hour"))
+    assert "range=3mo" in yahoo_chart_url(ChartRequest("ES", "h2", "2 hour", futures=True))
     assert "range=2y" in yahoo_chart_url(ChartRequest("AMD", "d", "daily"))
     for ticker, yahoo_symbol in YAHOO_SYMBOL_ALIASES.items():
         assert yahoo_symbol in yahoo_chart_url(ChartRequest(ticker, "d", "daily"))
