@@ -16,17 +16,26 @@ DEFAULT_CHART_TYPE = "c"
 DEFAULT_THEME = "light"
 DEFAULT_SCALE = "linear"
 DEFAULT_SCALE_FACTOR = 2
-DEFAULT_WIDTH = 466
-DEFAULT_HEIGHT = 219
+DEFAULT_WIDTH = 640
+DEFAULT_HEIGHT = 239
 CHART_RIGHT_MARGIN = 80
 MARKET_TIME_ZONE = ZoneInfo("America/New_York")
-STOCK_DAILY_VISIBLE_BARS = 240
-STOCK_WEEKLY_VISIBLE_BARS = 240
-STOCK_INTRADAY_VISIBLE_BARS = 180
+STOCK_DAILY_VISIBLE_BARS = 140
+STOCK_WEEKLY_VISIBLE_BARS = 160
+STOCK_INTRADAY_VISIBLE_BARS = 150
 STOCK_MONTHLY_VISIBLE_BARS = 240
 SMA_PERIODS = (20, 50, 200)
 SMA_COLORS = {20: (142, 43, 132), 50: (238, 126, 35), 200: (139, 111, 43)}
-FUTURES_INTRADAY_VISIBLE_BARS = 140
+LIGHT_DAILY_UP = (21, 141, 54)
+LIGHT_DAILY_DOWN = (213, 33, 45)
+LIGHT_DAILY_VOLUME_ALPHA = 0.38
+LIGHT_LINE_COLOR = (25, 105, 210)
+DARK_UP = (25, 200, 105)
+DARK_DOWN = (255, 82, 82)
+DARK_LINE_COLOR = (55, 160, 245)
+DARK_VOLUME_UP = (25, 120, 75)
+DARK_VOLUME_DOWN = (128, 58, 68)
+FUTURES_INTRADAY_VISIBLE_BARS = 120
 STOCK_5M_START = dt.time(4, 0)
 STOCK_5M_END = dt.time(20, 0)
 REGULAR_SESSION_START = dt.time(9, 30)
@@ -346,6 +355,13 @@ def _safe_float(value: Any) -> float | None:
         return None
     return number if math.isfinite(number) else None
 
+
+def _blend_rgb(fg: tuple[int, int, int], bg: tuple[int, int, int], alpha: float) -> tuple[int, int, int]:
+    return (
+        round(fg[0] * alpha + bg[0] * (1.0 - alpha)),
+        round(fg[1] * alpha + bg[1] * (1.0 - alpha)),
+        round(fg[2] * alpha + bg[2] * (1.0 - alpha)),
+    )
 
 
 def _range_cutoff(last_epoch: int, date_range: str) -> int | None:
@@ -708,13 +724,20 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
 
     width, height = DEFAULT_WIDTH * DEFAULT_SCALE_FACTOR, DEFAULT_HEIGHT * DEFAULT_SCALE_FACTOR
     dark = request.theme == "dark"
+    intraday = request.timeframe.startswith(("i", "h"))
     bg = (30, 34, 44) if dark else (250, 250, 250)
     grid = (43, 49, 62) if dark else (214, 218, 226)
     text = (148, 160, 181) if dark else (100, 108, 122)
     strong = (176, 186, 206) if dark else (50, 55, 65)
-    up, down = (25, 200, 105), (255, 82, 82)
-    line_color = (55, 160, 245) if dark else (25, 105, 210)
-    vol_up, vol_down = (25, 120, 75), (128, 58, 68)
+    if dark:
+        up, down = DARK_UP, DARK_DOWN
+        line_color = DARK_LINE_COLOR
+        vol_up, vol_down = DARK_VOLUME_UP, DARK_VOLUME_DOWN
+    else:
+        up, down = LIGHT_DAILY_UP, LIGHT_DAILY_DOWN
+        line_color = LIGHT_LINE_COLOR
+        vol_up = _blend_rgb(up, bg, LIGHT_DAILY_VOLUME_ALPHA)
+        vol_down = _blend_rgb(down, bg, LIGHT_DAILY_VOLUME_ALPHA)
 
     def font(size: int, bold: bool = False) -> Any:
         name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
@@ -745,7 +768,6 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     indexes = _visible_indexes(all_rows, request)
     rows = [all_rows[i] for i in indexes]
     base = rows[0][4]
-    intraday = request.timeframe.startswith(("i", "h"))
     span = rows[-1][0] - rows[0][0]
     period_shell = request.timeframe in {"w", "m"} and not intraday
 
@@ -895,19 +917,25 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
             label_x = max(x1 + 4, min(x2 - label_w - 4, x1 + (x2 - x1 - label_w) // 2))
             draw.text((label_x, price_top + 4), label, fill=session_text, font=small_font)
 
-    candle_w = max(2, min(8, int(plot_w / max(len(candles), 1) * 0.58)))
+    candle_w = max(2, min(8, round(plot_w / max(len(candles), 1) * 0.68)))
+
+    def bar_bounds(x: int) -> tuple[int, int]:
+        left = x - candle_w // 2
+        return left, left + candle_w - 1
+
     close_points: list[tuple[int, int]] = []
     for pos, (_, _, o, h, l, c, v) in enumerate(candles):
         x = x_at(pos)
         color = up if c >= o else down
         vh = min(vol_bottom - vol_top, round((v / vol_axis_high) * (vol_bottom - vol_top)))
-        draw.rectangle((x - candle_w // 2, vol_bottom - vh, x + candle_w // 2, vol_bottom), fill=vol_up if c >= o else vol_down)
+        bar_left, bar_right = bar_bounds(x)
+        draw.rectangle((bar_left, vol_bottom - vh, bar_right, vol_bottom), fill=vol_up if c >= o else vol_down)
         if request.chart_type == "l":
             close_points.append((x, y_at(c)))
             continue
         yo, yh, yl, yc = y_at(o), y_at(h), y_at(l), y_at(c)
         draw.line((x, yh, x, yl), fill=color, width=1)
-        draw.rectangle((x - candle_w // 2, min(yo, yc), x + candle_w // 2, max(yo, yc)), fill=color)
+        draw.rectangle((bar_left, min(yo, yc), bar_right, max(yo, yc)), fill=color)
     if close_points:
         draw.line(close_points, fill=line_color, width=2, joint="curve")
 
@@ -933,10 +961,14 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     change_label = f"{change:+.2f} ({pct:+.2f}%)"
 
     if period_shell:
-        title_font = font(38, True)
-        draw.text((8, 0), request.ticker, fill=strong, font=title_font)
-        title_w = draw.textbbox((8, 0), request.ticker, font=title_font)[2]
-        draw.text((title_w + 14, 10), date, fill=text, font=header_font)
+        header_x = 8
+        header_parts = [
+            (request.ticker, strong),
+            (f"   {date}", text),
+        ]
+        for part, color in header_parts:
+            draw.text((header_x, 6), part, fill=color, font=header_font)
+            header_x += draw.textbbox((0, 0), part, font=header_font)[2]
     else:
         header_x = 8
         header_parts = [
@@ -959,7 +991,7 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
         if value is not None:
             draw.text((8, 46 + row * 22), f"SMA {period} · {_fmt(value)}", fill=SMA_COLORS[period], font=sma_font)
     if period_shell:
-        side_font = font(24, True)
+        side_font = font(14)
         label = request.timeframe_label.upper()
         label_img = Image.new("RGBA", (220, 42), (0, 0, 0, 0))
         label_draw = ImageDraw.Draw(label_img)
@@ -970,7 +1002,7 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     last_scaled = scaled(last[4])
     badge_text = _axis_label(last_scaled, request)
     badge_w = draw.textbbox((0, 0), badge_text, font=badge_font)[2] + 10
-    bx, by = width - badge_w - 6, max(price_top, min(price_bottom - 25, y_at(last_scaled) - 13))
+    bx, by = width - badge_w - 2, max(price_top, min(price_bottom - 25, y_at(last_scaled) - 13))
     draw.rounded_rectangle((bx, by, bx + badge_w, by + 25), radius=2, fill=(245, 211, 65))
     draw.text((bx + 6, by + 2), badge_text, fill=(22, 24, 30), font=badge_font)
     for value in vol_ticks:
@@ -1146,8 +1178,8 @@ def self_test() -> None:
     monthly_url = yahoo_chart_url(ChartRequest("AMD", "m", "monthly"))
     assert "interval=1mo" in monthly_url and "period1=0" in monthly_url and "period2=" in monthly_url
     sample_rows = [(i, 1.0, 1.0, 1.0, float(i + 1), 1.0) for i in range(300)]
-    assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "i15", "15 min"))) == 180
-    assert len(_visible_indexes(sample_rows, ChartRequest("NQ", "i5", "5 min", futures=True))) == 140
+    assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "i15", "15 min"))) == STOCK_INTRADAY_VISIBLE_BARS
+    assert len(_visible_indexes(sample_rows, ChartRequest("NQ", "i5", "5 min", futures=True))) == FUTURES_INTRADAY_VISIBLE_BARS
     assert len(_visible_indexes(sample_rows + sample_rows, ChartRequest("AMD", "d", "daily"))) == STOCK_DAILY_VISIBLE_BARS
     assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "w", "weekly"))) == STOCK_WEEKLY_VISIBLE_BARS
     assert len(_visible_indexes(sample_rows, ChartRequest("AMD", "m", "monthly"))) == STOCK_MONTHLY_VISIBLE_BARS
