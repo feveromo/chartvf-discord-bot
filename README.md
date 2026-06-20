@@ -82,5 +82,5 @@ This bot is a long-running Discord worker, not an HTTP web service, so it does n
 ```bash
 python main.py --self-test
 python -m py_compile main.py charting.py
-pyright --pythonpath .venv/bin/python main.py charting.py  # optional
+pyright main.py charting.py  # optional
 ```

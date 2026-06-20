@@ -285,6 +285,12 @@ def parse_chart_command(content: str) -> ChartRequest | None:
     if not is_futures and not timeframe_explicit and not date_range_explicit:
         timeframe, timeframe_label = DEFAULT_STOCK_TIMEFRAME, DEFAULT_STOCK_TIMEFRAME_LABEL
 
+    if date_range and timeframe.startswith(("i", "h")):
+        raise ValueError(
+            "Date ranges only work with `d`, `w`, or `m` charts. "
+            "Use `;AAPL 1y` for a 1-year daily chart, or drop the range for intraday."
+        )
+
     return ChartRequest(
         ticker, timeframe, timeframe_label, chart_type, chart_type_label,
         theme, theme_label, scale, scale_label, date_range, date_range_label, is_futures,
@@ -387,7 +393,7 @@ def _collapse_monthly_rows(rows: list[ChartRow]) -> list[ChartRow]:
                 max(prev_high, high),
                 min(prev_low, low),
                 close,
-                max(prev_volume, volume),
+                prev_volume + volume,
             )
             continue
         collapsed.append((epoch, open_, high, low, close, volume))
@@ -762,6 +768,8 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     indexes = _visible_indexes(all_rows, request)
     rows = [all_rows[i] for i in indexes]
     base = rows[0][4]
+    if request.scale == "percentage" and base == 0:
+        raise NoChartData(f"Chart data has a zero starting price for `{request.ticker}`, so percent scale won't work.")
     span = rows[-1][0] - rows[0][0]
     period_shell = request.timeframe in {"w", "m"} and not intraday
 
@@ -1075,14 +1083,26 @@ def _quote_time_label(quote: dict[str, Any]) -> str | None:
     return stamp.strftime("%I:%M %p ET").lstrip("0")
 
 
-def _stock_previous_close(meta: dict[str, Any], valid_closes: list[float], request: ChartRequest) -> float | None:
+def _stock_previous_close(meta: dict[str, Any], closes: list[Any], request: ChartRequest) -> float | None:
+    valid_closes = [close for close in (_safe_float(value) for value in closes) if close is not None]
     if request.timeframe == "d" and len(valid_closes) > 1:
+        latest_raw_close = _safe_float(closes[-1]) if closes else None
+        if latest_raw_close is None:
+            previous = _safe_float(meta.get("previousClose"))
+            if previous is not None:
+                return previous
+            chart_previous = _safe_float(meta.get("chartPreviousClose"))
+            if chart_previous is not None:
+                return chart_previous
+            return valid_closes[-1]
         return valid_closes[-2]
-    return (
-        _safe_float(meta.get("previousClose"))
-        or _safe_float(meta.get("chartPreviousClose"))
-        or (valid_closes[-2] if len(valid_closes) > 1 else None)
-    )
+    previous = _safe_float(meta.get("previousClose"))
+    if previous is not None:
+        return previous
+    chart_previous = _safe_float(meta.get("chartPreviousClose"))
+    if chart_previous is not None:
+        return chart_previous
+    return valid_closes[-2] if len(valid_closes) > 1 else None
 
 
 def _latest_quote_price_time(
@@ -1149,6 +1169,7 @@ def self_test() -> None:
         ChartRequest("AMD", "i5", "5 min"),
     ) == 511.57
     assert _stock_previous_close({}, [488.45, 511.57, 551.24], ChartRequest("AMD", "d", "daily")) == 511.57
+    assert _stock_previous_close({}, [100.0, 110.0, None], ChartRequest("BUG", "d", "daily")) == 110.0
     pending_rows = _quote_rows({
         "date": [1, 2],
         "open": [10, 11],
@@ -1170,7 +1191,7 @@ def self_test() -> None:
         "volume": [100, 80, 120],
     }, ChartRequest("AMD", "m", "monthly"))
     assert monthly_rows == [
-        (utc_epoch(2026, 1, 15), 10.0, 15.0, 8.0, 14.0, 100.0),
+        (utc_epoch(2026, 1, 15), 10.0, 15.0, 8.0, 14.0, 180.0),
         (utc_epoch(2026, 2, 1), 20.0, 22.0, 19.0, 21.0, 120.0),
     ]
     assert parse_chart_command(";amd 1") == ChartRequest("AMD", "i1", "1 min")
@@ -1345,6 +1366,13 @@ def self_test() -> None:
         assert "market chart data" in str(error)
     else:
         raise AssertionError("unsupported stock intraday alias should be rejected")
+    for bad_range_command in (";AAPL 1y 5", ";AAPL 5 1y percent", ";fut ES 1y 15"):
+        try:
+            parse_chart_command(bad_range_command)
+        except ValueError as error:
+            assert "Date ranges only work" in str(error)
+        else:
+            raise AssertionError("date ranges should be rejected on intraday charts")
 
     # Futures: use `;fut`, not `;f` — `;f` is Ford.
     assert parse_chart_command(";f") == ChartRequest("F", "i5", "5 min")
@@ -1387,6 +1415,20 @@ def self_test() -> None:
         "volume": [100, 150, 120],
     }, ChartRequest("ES", futures=True))
     assert sample_png.startswith(b"\x89PNG") and len(sample_png) > 1000
+    try:
+        render_price_chart_png({
+            "ticker": "ZERO",
+            "date": [1, 2],
+            "open": [0, 1],
+            "high": [0, 1],
+            "low": [0, 1],
+            "close": [0, 1],
+            "volume": [1, 1],
+        }, ChartRequest("ZERO", "d", "daily", scale="percentage", scale_label="percent"))
+    except NoChartData as error:
+        assert "zero starting price" in str(error)
+    else:
+        raise AssertionError("percent scale should reject a zero starting price")
     smooth_close = [100.0 + math.sin(i / 4) * 3.0 + i * 0.03 for i in range(80)]
     smooth_png = render_price_chart_png({
         "ticker": "SMA",

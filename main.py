@@ -1,4 +1,5 @@
 import io
+from json import JSONDecodeError
 import os
 import sys
 import time
@@ -29,6 +30,10 @@ if __name__ == "__main__" and "--self-test" in sys.argv:
 import aiohttp
 import discord
 from dotenv import load_dotenv
+
+
+class MarketDataProviderError(RuntimeError):
+    pass
 
 HELP_TEXT = """**ChartVF**
 
@@ -74,6 +79,7 @@ USER_AGENT = (
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
+NO_MENTIONS = discord.AllowedMentions.none()
 
 
 @client.event
@@ -88,16 +94,16 @@ async def on_message(message: discord.Message) -> None:
 
     command_text = message.content[len(PREFIX):].strip()
     if not command_text:
-        await message.channel.send(HELP_TEXT)
+        await message.channel.send(HELP_TEXT, allowed_mentions=NO_MENTIONS)
         return
     if command_text.split(maxsplit=1)[0].lower() in {"help", "h"}:
-        await message.channel.send(HELP_TEXT)
+        await message.channel.send(HELP_TEXT, allowed_mentions=NO_MENTIONS)
         return
 
     try:
         request = parse_chart_command(message.content)
     except ValueError as error:
-        await message.channel.send(str(error))
+        await message.channel.send(str(error), allowed_mentions=NO_MENTIONS)
         return
 
     if request:
@@ -133,12 +139,17 @@ async def fetch_market_chart_data(session: aiohttp.ClientSession, request: Chart
         if response.status == 404:
             raise NoChartData(f"No chart data found for `{request.ticker}`.")
         if response.status != 200:
-            raise RuntimeError(f"Chart data fetch returned HTTP {response.status}")
+            raise MarketDataProviderError("Market data provider returned an error")
         data = await response.json(content_type=None)
 
     chart = data.get("chart") or {}
-    if chart.get("error"):
-        raise NoChartData(f"No chart data found for `{request.ticker}`.")
+    error = chart.get("error")
+    if error:
+        code = str(error.get("code") if isinstance(error, dict) else error).lower()
+        description = str(error.get("description") if isinstance(error, dict) else "").lower()
+        if "not found" in code or "not found" in description or "no data" in description:
+            raise NoChartData(f"No chart data found for `{request.ticker}`.")
+        raise MarketDataProviderError("Market data provider returned an error")
     results = chart.get("result") or []
     if not results:
         raise NoChartData(f"No chart data found for `{request.ticker}`.")
@@ -148,11 +159,15 @@ async def fetch_market_chart_data(session: aiohttp.ClientSession, request: Chart
     raw_quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
     dates = result.get("timestamp") or []
     closes = raw_quote.get("close") or []
-    valid_closes = [close for close in (_safe_float(value) for value in closes) if close is not None]
     last, last_time = _latest_quote_price_time(meta, dates, closes, request)
-    prev = _stock_previous_close(meta, valid_closes, request)
+    prev = _stock_previous_close(meta, closes, request)
     if request.timeframe != "d":
-        prev = await fetch_daily_previous_close(session, request) or prev
+        try:
+            daily_prev = await fetch_daily_previous_close(session, request)
+        except (aiohttp.ClientError, TimeoutError, JSONDecodeError):
+            daily_prev = None
+        if daily_prev is not None:
+            prev = daily_prev
     change = (last - prev) if last is not None and prev else None
     quote = {
         "ticker": request.ticker,
@@ -187,10 +202,10 @@ async def send_chart(channel: discord.abc.Messageable, request: ChartRequest) ->
                 image = render_price_chart_png(quote, request)
                 description = quote_description(quote)
         except NoChartData as error:
-            await channel.send(str(error))
+            await channel.send(str(error), allowed_mentions=NO_MENTIONS)
             return
-        except Exception as error:
-            await channel.send(f"Upload failed ({error}).")
+        except (aiohttp.ClientError, TimeoutError, JSONDecodeError, MarketDataProviderError):
+            await channel.send("Market data is temporarily unavailable. Try again in a minute.", allowed_mentions=NO_MENTIONS)
             return
 
     filename = f"{request.ticker}_{request.timeframe}_{int(time.time())}.png"
@@ -201,7 +216,10 @@ async def send_chart(channel: discord.abc.Messageable, request: ChartRequest) ->
         color=0x2ECC71 if (_safe_float(quote.get("perfDayUsd")) or 0.0) >= 0 else 0xFF5252,
     )
     embed.set_image(url=f"attachment://{filename}")
-    await channel.send(embed=embed, file=file)
+    try:
+        await channel.send(embed=embed, file=file, allowed_mentions=NO_MENTIONS)
+    except discord.HTTPException:
+        await channel.send("Chart rendered, but Discord rejected the image upload.", allowed_mentions=NO_MENTIONS)
 
 
 def main() -> None:
