@@ -48,7 +48,7 @@ HELP_TEXT = """**ChartVF**
 `;QQQ w line` → weekly line chart
 `;LULU 1y` → 1-year chart
 `;AAPL dark log` → dark theme, log scale
-`;fut ES` → E-mini S&P daily candle
+`;fut ES` → E-mini S&P latest 5-minute chart
 `;fut ES 15` → E-mini S&P 15-minute chart
 `;fut CL w line` → crude oil weekly line
 `;futures GC 1y` → gold 1-year chart
@@ -65,7 +65,7 @@ Options can be in any order after the ticker.
 
 **Futures** (`;fut`/`;future`/`;futures`): `;f` is still Ford (`F`).
 
-**Freshness**: bare stock commands default to the latest 5-minute chart. Every
+**Freshness**: bare stock and futures commands default to the latest 5-minute chart. Every
 chart image is rendered locally from market chart data.
 """
 

@@ -42,6 +42,9 @@ REGULAR_SESSION_START = dt.time(9, 30)
 REGULAR_SESSION_END = dt.time(16, 0)
 EXTENDED_WICK_PCT_LIMIT = 0.004
 EXTENDED_WICK_RANGE_MULTIPLE = 3.0
+FUTURES_STALE_WICK_RANGE_MULTIPLE = 2.0
+FUTURES_STALE_EXTREME_MIN_REPEATS = 3
+FUTURES_STALE_EXTREME_MIN_FLAGS = 2
 SPARSE_CHART_MIN_BARS = 24
 
 TIMEFRAMES = {
@@ -282,7 +285,7 @@ def parse_chart_command(content: str) -> ChartRequest | None:
                 f"Unknown chart option `{raw_option}`. Use `d`, `w`, `m`, stock intraday `1`, `2`, `5`, `15`, `30`, `60`, `4h`, `candle`, `line`, `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`, `dark`, `light`, `linear`, `log`, or `percent`. Futures also support `3`, `10`, and `2h`."
             )
 
-    if not is_futures and not timeframe_explicit and not date_range_explicit:
+    if not timeframe_explicit and not date_range_explicit:
         timeframe, timeframe_label = DEFAULT_STOCK_TIMEFRAME, DEFAULT_STOCK_TIMEFRAME_LABEL
 
     if date_range and timeframe.startswith(("i", "h")):
@@ -624,6 +627,59 @@ def _clean_stock_extended_wicks(rows: list[ChartRow], request: ChartRequest) -> 
     return cleaned
 
 
+def _price_key(value: float) -> float:
+    return round(value, 8)
+
+
+def _clean_futures_intraday_wicks(rows: list[ChartRow], request: ChartRequest) -> list[ChartRow]:
+    if not request.futures or not request.timeframe.startswith(("i", "h")):
+        return rows
+    ranges = sorted(max(0.0, row[2] - row[3]) for row in rows if row[2] >= row[3])
+    typical_range = ranges[len(ranges) // 2] if ranges else 0.0
+    threshold = max(abs(rows[-1][4]) * 0.0004, typical_range * FUTURES_STALE_WICK_RANGE_MULTIPLE, 0.0001)
+    high_counts: dict[float, int] = {}
+    low_counts: dict[float, int] = {}
+    high_flags: dict[float, int] = {}
+    low_flags: dict[float, int] = {}
+
+    for epoch, open_, high, low, close, _ in rows:
+        if _futures_globex_session_key(epoch) is None:
+            continue
+        body_high = max(open_, close)
+        body_low = min(open_, close)
+        high_key = _price_key(high)
+        low_key = _price_key(low)
+        high_counts[high_key] = high_counts.get(high_key, 0) + 1
+        low_counts[low_key] = low_counts.get(low_key, 0) + 1
+        if high - body_high > threshold:
+            high_flags[high_key] = high_flags.get(high_key, 0) + 1
+        if body_low - low > threshold:
+            low_flags[low_key] = low_flags.get(low_key, 0) + 1
+
+    stale_highs = {
+        value for value, count in high_counts.items()
+        if count >= FUTURES_STALE_EXTREME_MIN_REPEATS and high_flags.get(value, 0) >= FUTURES_STALE_EXTREME_MIN_FLAGS
+    }
+    stale_lows = {
+        value for value, count in low_counts.items()
+        if count >= FUTURES_STALE_EXTREME_MIN_REPEATS and low_flags.get(value, 0) >= FUTURES_STALE_EXTREME_MIN_FLAGS
+    }
+    if not stale_highs and not stale_lows:
+        return rows
+
+    cleaned: list[ChartRow] = []
+    for epoch, open_, high, low, close, volume in rows:
+        body_high = max(open_, close)
+        body_low = min(open_, close)
+        if _futures_globex_session_key(epoch) is not None:
+            if _price_key(high) in stale_highs and high > body_high:
+                high = body_high
+            if _price_key(low) in stale_lows and low < body_low:
+                low = body_low
+        cleaned.append((epoch, open_, max(high, body_high), min(low, body_low), close, volume))
+    return cleaned
+
+
 def _chart_x_positions(count: int, left: int, plot_w: int) -> list[int]:
     if count < SPARSE_CHART_MIN_BARS:
         step = min(32, plot_w // SPARSE_CHART_MIN_BARS)
@@ -785,7 +841,7 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     price_top, price_bottom = top, vol_top - gap
     plot_right = width - right
     plot_w = plot_right - left
-    all_rows = _clean_stock_extended_wicks(_quote_rows(quote, request), request)
+    all_rows = _clean_futures_intraday_wicks(_clean_stock_extended_wicks(_quote_rows(quote, request), request), request)
     indexes = _visible_indexes(all_rows, request)
     rows = [all_rows[i] for i in indexes]
     base = rows[0][4]
@@ -1413,6 +1469,40 @@ def self_test() -> None:
     assert h4_cleaned[0][3] == 100.0
     assert h4_cleaned[3][3] == 80.0
     assert h4_cleaned[4][2] == 100.9
+    futures_wick_rows = [
+        (et_epoch(18, 0), 100.0, 101.0, 99.0, 100.5, 1.0),
+        (et_epoch(18, 5), 100.5, 101.5, 100.0, 101.0, 1.0),
+        (et_epoch(18, 10), 101.0, 125.0, 100.5, 101.5, 1.0),
+        (et_epoch(18, 15), 101.5, 102.5, 101.0, 102.0, 1.0),
+        (et_epoch(18, 20), 102.0, 125.0, 101.5, 102.5, 1.0),
+        (et_epoch(18, 25), 102.5, 103.5, 102.0, 103.0, 1.0),
+        (et_epoch(18, 30), 103.0, 125.0, 102.5, 103.5, 1.0),
+    ]
+    futures_cleaned = _clean_futures_intraday_wicks(
+        futures_wick_rows,
+        ChartRequest("ES", "i5", "5 min", futures=True),
+    )
+    assert futures_cleaned[2][2] == 101.5
+    assert futures_cleaned[4][2] == 102.5
+    assert futures_cleaned[6][2] == 103.5
+    regular_futures_rows = [
+        (et_epoch(10, 0), 100.0, 125.0, 99.0, 100.5, 1.0),
+        (et_epoch(10, 5), 100.5, 125.0, 100.0, 101.0, 1.0),
+        (et_epoch(10, 10), 101.0, 125.0, 100.5, 101.5, 1.0),
+        (et_epoch(10, 15), 101.5, 102.5, 101.0, 102.0, 1.0),
+    ]
+    assert _clean_futures_intraday_wicks(
+        regular_futures_rows,
+        ChartRequest("ES", "i5", "5 min", futures=True),
+    )[0][2] == 125.0
+    mixed_session_rows = futures_wick_rows + [
+        (et_epoch(10, 0), 124.0, 125.0, 123.0, 124.5, 1.0),
+    ]
+    mixed_cleaned = _clean_futures_intraday_wicks(
+        mixed_session_rows,
+        ChartRequest("ES", "i5", "5 min", futures=True),
+    )
+    assert mixed_cleaned[-1][2] == 125.0
     sparse_positions = _chart_x_positions(2, 60, 776)
     assert sparse_positions[0] > 760 and sparse_positions[1] == 835
     assert _date_label(1781536808, True, 3600) == "11:20"
@@ -1434,7 +1524,7 @@ def self_test() -> None:
 
     # Futures: use `;fut`, not `;f` — `;f` is Ford.
     assert parse_chart_command(";f") == ChartRequest("F", "i5", "5 min")
-    assert parse_chart_command(";fut es") == ChartRequest("ES", futures=True)
+    assert parse_chart_command(";fut es") == ChartRequest("ES", "i5", "5 min", futures=True)
     assert parse_chart_command(";fut cl w line") == ChartRequest(
         "CL", "w", "weekly", "l", "line", futures=True
     )
@@ -1461,7 +1551,7 @@ def self_test() -> None:
     assert aggregated["low"] == [9.0, 12.0]
     assert aggregated["close"] == [12.5, 13.5]
     assert aggregated["volume"] == [6.0, 4.0]
-    assert parse_chart_command(";fut 6e") == ChartRequest("6E", futures=True)
+    assert parse_chart_command(";fut 6e") == ChartRequest("6E", "i5", "5 min", futures=True)
     sample_png = render_price_chart_png({
         "ticker": "ES",
         "name": "S&P 500",
