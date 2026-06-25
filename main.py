@@ -1,7 +1,6 @@
 import io
 from json import JSONDecodeError
 import os
-import sys
 import time
 from typing import Any
 
@@ -17,15 +16,8 @@ from charting import (
     parse_chart_command,
     quote_description,
     render_price_chart_png,
-    self_test,
     yahoo_chart_url,
 )
-
-
-if __name__ == "__main__" and "--self-test" in sys.argv:
-    self_test()
-    print("self-test ok")
-    raise SystemExit(0)
 
 import aiohttp
 import discord
