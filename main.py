@@ -8,6 +8,8 @@ from charting import (
     PREFIX,
     ChartRequest,
     NoChartData,
+    _has_close_only_latest_ohlc,
+    _patch_close_only_latest_ohlc,
     _safe_float,
     _latest_quote_price_time,
     aggregate_yahoo_chart_data,
@@ -126,6 +128,40 @@ async def fetch_daily_previous_close(session: aiohttp.ClientSession, request: Ch
     return valid_closes[-2] if len(valid_closes) > 1 else None
 
 
+async def fetch_current_day_intraday_quote(session: aiohttp.ClientSession, request: ChartRequest) -> dict[str, Any] | None:
+    intraday_request = ChartRequest(
+        request.ticker,
+        "i1",
+        "1 min",
+        futures=request.futures,
+    )
+    intraday_url = yahoo_chart_url(intraday_request).replace("range=5d", "range=1d").replace(
+        "includePrePost=true",
+        "includePrePost=false",
+    )
+    async with session.get(intraday_url, headers={"Accept": "application/json"}) as response:
+        if response.status != 200:
+            return None
+        data = await response.json(content_type=None)
+
+    chart = data.get("chart") or {}
+    results = chart.get("result") or []
+    if not results:
+        return None
+    result = results[0]
+    raw_quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    return {
+        "ticker": request.ticker,
+        "futures": request.futures,
+        "date": result.get("timestamp") or [],
+        "open": raw_quote.get("open") or [],
+        "high": raw_quote.get("high") or [],
+        "low": raw_quote.get("low") or [],
+        "close": raw_quote.get("close") or [],
+        "volume": raw_quote.get("volume") or [],
+    }
+
+
 async def fetch_market_chart_data(session: aiohttp.ClientSession, request: ChartRequest) -> dict[str, Any]:
     async with session.get(yahoo_chart_url(request), headers={"Accept": "application/json"}) as response:
         if response.status == 404:
@@ -177,6 +213,13 @@ async def fetch_market_chart_data(session: aiohttp.ClientSession, request: Chart
         "perfDayUsd": change,
         "perfDayPct": (change / prev * 100) if change is not None and prev else None,
     }
+    if request.timeframe == "d" and not request.futures and _has_close_only_latest_ohlc(quote):
+        try:
+            intraday_quote = await fetch_current_day_intraday_quote(session, request)
+        except (aiohttp.ClientError, TimeoutError, JSONDecodeError):
+            intraday_quote = None
+        if intraday_quote is not None:
+            quote = _patch_close_only_latest_ohlc(quote, intraday_quote)
     return aggregate_yahoo_chart_data(quote, request)
 
 

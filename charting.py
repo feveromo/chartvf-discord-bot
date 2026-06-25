@@ -435,6 +435,65 @@ def _drop_live_quote_row(rows: list[ChartRow], request: ChartRequest) -> list[Ch
     return rows
 
 
+def _has_close_only_latest_ohlc(quote: dict[str, Any]) -> bool:
+    opens = quote.get("open") or []
+    highs = quote.get("high") or []
+    lows = quote.get("low") or []
+    closes = quote.get("close") or []
+    row_count = min(map(len, (opens, highs, lows, closes)))
+    if row_count == 0:
+        return False
+    last = row_count - 1
+    o, h, l = (_safe_float(values[last]) for values in (opens, highs, lows))
+    c = _safe_float(closes[last])
+    return c is not None and c > 0 and o == h == l == 0
+
+
+def _patch_close_only_latest_ohlc(quote: dict[str, Any], intraday_quote: dict[str, Any]) -> dict[str, Any]:
+    if not _has_close_only_latest_ohlc(quote):
+        return quote
+
+    intraday_opens = intraday_quote.get("open") or []
+    intraday_highs = intraday_quote.get("high") or []
+    intraday_lows = intraday_quote.get("low") or []
+    intraday_closes = intraday_quote.get("close") or []
+    intraday_rows: list[tuple[float, float, float, float]] = []
+    for i in range(min(map(len, (intraday_opens, intraday_highs, intraday_lows, intraday_closes)))):
+        o, h, l, c = (_safe_float(values[i]) for values in (intraday_opens, intraday_highs, intraday_lows, intraday_closes))
+        if o is None or h is None or l is None or c is None or h < l:
+            continue
+        if c > 0 and o == h == l == 0:
+            continue
+        intraday_rows.append((o, h, l, c))
+    if not intraday_rows:
+        return quote
+
+    opens = quote.get("open") or []
+    highs = quote.get("high") or []
+    lows = quote.get("low") or []
+    closes = quote.get("close") or []
+    row_count = min(map(len, (opens, highs, lows, closes)))
+    last = row_count - 1
+    close = _safe_float(closes[last])
+    if close is None:
+        return quote
+
+    patched = dict(quote)
+    patched_opens = list(opens)
+    patched_highs = list(highs)
+    patched_lows = list(lows)
+    patched_closes = list(closes)
+    patched_opens[last] = intraday_rows[0][0]
+    patched_highs[last] = max(row[1] for row in intraday_rows)
+    patched_lows[last] = min(row[2] for row in intraday_rows)
+    patched_closes[last] = close
+    patched["open"] = patched_opens
+    patched["high"] = patched_highs
+    patched["low"] = patched_lows
+    patched["close"] = patched_closes
+    return patched
+
+
 def _quote_rows(quote: dict[str, Any], request: ChartRequest) -> list[ChartRow]:
     dates = quote.get("date") or []
     opens = quote.get("open") or []
@@ -450,8 +509,10 @@ def _quote_rows(quote: dict[str, Any], request: ChartRequest) -> list[ChartRow]:
         c = _safe_float(closes[i])
         if c is None and i == row_count - 1:
             c = last_close
-        if None in (o, h, l, c):
+        if o is None or h is None or l is None or c is None:
             continue
+        if c > 0 and o == h == l == 0:
+            o = h = l = c
         v = _safe_float(volumes[i]) if i < len(volumes) else 0.0
         rows.append((int(dates[i]), o or 0.0, h or 0.0, l or 0.0, c or 0.0, v or 0.0))
     rows = _drop_live_quote_row(rows, request)

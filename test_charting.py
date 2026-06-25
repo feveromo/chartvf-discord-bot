@@ -30,6 +30,7 @@ from charting import (
     _latest_quote_price_time,
     _month_tick_label,
     _nice_linear_axis,
+    _patch_close_only_latest_ohlc,
     _quote_rows,
     _source_interval_seconds,
     _stock_5m_today_indexes,
@@ -83,6 +84,26 @@ def test_charting_regressions() -> None:
         "lastClose": 12.5,
     }, ChartRequest("AMD", "d", "daily"))
     assert pending_rows[-1][4] == 12.5
+    bad_vix_daily = {
+        "date": [1, 2],
+        "open": [19.67, 0.0],
+        "high": [20.54, 0.0],
+        "low": [18.61, 0.0],
+        "close": [19.49, 18.63],
+        "volume": [0, 0],
+    }
+    vix_rows = _quote_rows(bad_vix_daily, ChartRequest("VIX", "d", "daily"))
+    assert vix_rows[-1][1:5] == (18.63, 18.63, 18.63, 18.63)
+    vix_intraday = {
+        "date": [10, 11, 12],
+        "open": [19.13, 19.5, 18.63],
+        "high": [20.34, 19.58, 18.63],
+        "low": [18.04, 18.86, 18.63],
+        "close": [19.5, 18.86, 18.63],
+        "volume": [0, 0, 0],
+    }
+    patched_vix = _patch_close_only_latest_ohlc(bad_vix_daily, vix_intraday)
+    assert _quote_rows(patched_vix, ChartRequest("VIX", "d", "daily"))[-1][1:5] == (19.13, 20.34, 18.04, 18.63)
     def utc_epoch(year: int, month: int, day: int) -> int:
         return int(dt.datetime(year, month, day, tzinfo=dt.timezone.utc).timestamp())
     monthly_rows = _quote_rows({
