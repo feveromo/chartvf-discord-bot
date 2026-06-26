@@ -38,7 +38,7 @@ HELP_TEXT = """**ChartVF**
 **Examples**
 `;AAPL` → latest 5-minute candle chart
 `;AAPL d` → daily candle chart
-`;AMD 1` → AMD 1-minute intraday chart
+`;AMD 3` → AMD 3-minute intraday chart
 `;QQQ w line` → weekly line chart
 `;LULU 1y` → 1-year chart
 `;AAPL dark log` → dark theme, log scale
@@ -49,7 +49,7 @@ HELP_TEXT = """**ChartVF**
 Indexes: `;SPX`, `;NDX`, `;DJX`/`;DJI`/`;DJIA`, `;RUT`, `;RUI`, `;VIX`, `;IXIC`, `;OEX`
 
 **Options** (same for stocks and futures)
-Timeframes: stocks support `d`, `w`, `m`, plus intraday `1`, `2`, `5`, `15`, `30`, `60`, `4h`; futures also support `3`, `10`, `2h`
+Timeframes: stocks support `d`, `w`, `m`, plus intraday `1`, `2`, `3`, `5`, `15`, `30`, `60`, `4h`; futures also support `10`, `2h`
 Types: `candle`, `line`
 Ranges: `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`
 Themes: `dark`, `light`

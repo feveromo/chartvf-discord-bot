@@ -119,8 +119,10 @@ def test_charting_regressions() -> None:
         (utc_epoch(2026, 2, 1), 20.0, 22.0, 19.0, 21.0, 120.0),
     ]
     assert parse_chart_command(";amd 1") == ChartRequest("AMD", "i1", "1 min")
+    assert parse_chart_command(";amd 3") == ChartRequest("AMD", "i3", "3 min")
     assert parse_chart_command(";amd 4h") == ChartRequest("AMD", "h4", "4 hour")
     assert "interval=1m" in yahoo_chart_url(ChartRequest("AMD", "i1", "1 min"))
+    assert "interval=1m" in yahoo_chart_url(ChartRequest("AMD", "i3", "3 min"))
     assert "range=5d" in yahoo_chart_url(ChartRequest("AMD", "i5", "5 min"))
     assert "interval=5m" in yahoo_chart_url(ChartRequest("AMD", "i5", "5 min"))
     assert "includePrePost=true" in yahoo_chart_url(ChartRequest("AMD", "i5", "5 min"))
@@ -390,6 +392,21 @@ def test_charting_regressions() -> None:
     assert aggregated["low"] == [9.0, 12.0]
     assert aggregated["close"] == [12.5, 13.5]
     assert aggregated["volume"] == [6.0, 4.0]
+    stock_aggregated = aggregate_yahoo_chart_data({
+        "ticker": "AMD",
+        "date": [0, 60, 120, 180],
+        "open": [10, 11, 12, 13],
+        "high": [11, 12, 13, 14],
+        "low": [9, 10, 11, 12],
+        "close": [10.5, 11.5, 12.5, 13.5],
+        "volume": [1, 2, 3, 4],
+    }, ChartRequest("AMD", "i3", "3 min"))
+    assert stock_aggregated["date"] == [0, 180]
+    assert stock_aggregated["open"] == [10.0, 13.0]
+    assert stock_aggregated["high"] == [13.0, 14.0]
+    assert stock_aggregated["low"] == [9.0, 12.0]
+    assert stock_aggregated["close"] == [12.5, 13.5]
+    assert stock_aggregated["volume"] == [6.0, 4.0]
     assert parse_chart_command(";fut 6e") == ChartRequest("6E", "i5", "5 min", futures=True)
     sample_png = render_price_chart_png({
         "ticker": "ES",

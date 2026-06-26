@@ -107,6 +107,7 @@ DATE_RANGES = {
 STOCK_INTRADAY_INTERVALS = {
     "i1": "1m",
     "i2": "2m",
+    "i3": "1m",
     "i5": "5m",
     "i15": "15m",
     "i30": "30m",
@@ -181,7 +182,7 @@ YAHOO_SYMBOL_ALIASES = {
     "OEX": "^OEX",
 }
 STOCK_INTRADAY_UNSUPPORTED_MESSAGE = (
-    "Stock intraday supports `1`, `2`, `5`, `15`, `30`, `60`, and `4h` "
+    "Stock intraday supports `1`, `2`, `3`, `5`, `15`, `30`, `60`, and `4h` "
     "via market chart data. Use `d`, `w`, or `m` for higher timeframes."
 )
 
@@ -282,7 +283,7 @@ def parse_chart_command(content: str) -> ChartRequest | None:
             date_range_explicit = True
         else:
             raise ValueError(
-                f"Unknown chart option `{raw_option}`. Use `d`, `w`, `m`, stock intraday `1`, `2`, `5`, `15`, `30`, `60`, `4h`, `candle`, `line`, `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`, `dark`, `light`, `linear`, `log`, or `percent`. Futures also support `3`, `10`, and `2h`."
+                f"Unknown chart option `{raw_option}`. Use `d`, `w`, `m`, stock intraday `1`, `2`, `3`, `5`, `15`, `30`, `60`, `4h`, `candle`, `line`, `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`, `dark`, `light`, `linear`, `log`, or `percent`. Futures also support `10` and `2h`."
             )
 
     if not timeframe_explicit and not date_range_explicit:

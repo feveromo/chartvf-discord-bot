@@ -20,7 +20,7 @@ Options can be in any order after the ticker.
 | --- | --- |
 | `;AAPL` | latest 5-minute stock candles |
 | `;AAPL d` | daily candles |
-| `;AMD 1` | 1-minute intraday candles |
+| `;AMD 3` | 3-minute intraday candles |
 | `;AAPL w` | weekly candles |
 | `;AAPL m line` | monthly line chart |
 | `;AAPL 1y` | 1-year daily chart |
@@ -40,7 +40,7 @@ Options can be in any order after the ticker.
 
 | Option | Values |
 | --- | --- |
-| Timeframes | stocks: `d`, `w`, `m`, `1`, `2`, `5`, `15`, `30`, `60`, `4h`; futures also: `3`, `10`, `2h` |
+| Timeframes | stocks: `d`, `w`, `m`, `1`, `2`, `3`, `5`, `15`, `30`, `60`, `4h`; futures also: `10`, `2h` |
 | Chart types | `candle`, `line` |
 | Ranges | `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max` |
 | Themes | `light`, `dark` |
