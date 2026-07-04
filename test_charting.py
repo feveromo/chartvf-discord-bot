@@ -134,6 +134,52 @@ def test_charting_regressions() -> None:
     assert "range=2y" in yahoo_chart_url(ChartRequest("AMD", "d", "daily"))
     for ticker, yahoo_symbol in YAHOO_SYMBOL_ALIASES.items():
         assert yahoo_symbol in yahoo_chart_url(ChartRequest(ticker, "d", "daily"))
+    assert parse_chart_command(";btc d") == ChartRequest(
+        "BTC",
+        "d",
+        "daily",
+        crypto_market="auto",
+    )
+    assert parse_chart_command(";bitcoin d") == ChartRequest(
+        "BTC",
+        "d",
+        "daily",
+        crypto_market="auto",
+    )
+    assert parse_chart_command(";ethereum 1y percent") == ChartRequest(
+        "ETH",
+        "d",
+        "daily",
+        scale="percentage",
+        scale_label="percent",
+        date_range="y1",
+        date_range_label="1 year",
+        crypto_market="auto",
+    )
+    assert parse_chart_command(";btc 5") == ChartRequest(
+        "BTC",
+        "i5",
+        "5 min",
+        crypto_market="auto",
+    )
+    assert parse_chart_command(";btc max") == ChartRequest(
+        "BTC",
+        "d",
+        "daily",
+        date_range="max",
+        date_range_label="max",
+        crypto_market="auto",
+    )
+    assert chart_title(parse_chart_command(";btc d") or ChartRequest("BTC")) == "BTC · daily candles"
+    assert chart_title(parse_chart_command(";btc 5") or ChartRequest("BTC")) == "BTC · 5 min candles"
+    for terse_crypto_command in (";btc", ";btc 1", ";btc 2", ";btc 3", ";btc 5", ";btc 10", ";btc 15", ";btc 30", ";btc 60", ";btc 2h", ";btc 4h", ";eth 15"):
+        req = parse_chart_command(terse_crypto_command)
+        assert req is not None and req.crypto_market == "auto" and req.timeframe.startswith(("i", "h"))
+    for longer_crypto_command in (";btc d", ";btc w", ";btc m", ";btc 1y", ";btc max", ";eth w"):
+        req = parse_chart_command(longer_crypto_command)
+        assert req is not None and req.crypto_market == "auto" and not req.timeframe.startswith(("i", "h"))
+    assert "BTC-USD" in yahoo_chart_url(ChartRequest("BTC", "d", "daily"))
+    assert "ETH-USD" in yahoo_chart_url(ChartRequest("ETH", "d", "daily"))
     assert "range=2y" in yahoo_chart_url(ChartRequest("AMD", "d", "daily", date_range="y1"))
     assert "interval=1wk" in yahoo_chart_url(ChartRequest("AMD", "w", "weekly"))
     assert "range=10y" in yahoo_chart_url(ChartRequest("AMD", "w", "weekly"))
@@ -195,6 +241,10 @@ def test_charting_regressions() -> None:
     assert _header_volume_label((et_epoch(7, 10), 1, 1, 1, 1, 10_500), ChartRequest("AMD", "i5", "5 min")) == "10.5K"
     assert _header_volume_label((et_epoch(7, 10), 1, 2, 1, 2, 0), ChartRequest("ES", "i5", "5 min", futures=True)) == "n/a"
     assert _header_volume_label((et_epoch(7, 10), 1, 2, 1, 2, 10_500), ChartRequest("ES", "i5", "5 min", futures=True)) == "10.5K"
+    assert _header_volume_label(
+        (et_epoch(7, 10), 1, 2, 1, 2, 0),
+        ChartRequest("BTC", "i5", "5 min", crypto_market="auto"),
+    ) == "0"
     assert _stock_extended_session_key(et_epoch(7, 10)) == ("pre", dt.date(2026, 6, 15))
     assert _stock_extended_session_key(et_epoch(10, 10)) is None
     assert _stock_extended_session_key(et_epoch(16, 0)) == ("after", dt.date(2026, 6, 15))

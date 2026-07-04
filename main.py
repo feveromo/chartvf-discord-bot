@@ -5,6 +5,7 @@ import time
 from typing import Any
 
 from charting import (
+    BINANCE_CRYPTO_SYMBOLS,
     PREFIX,
     ChartRequest,
     NoChartData,
@@ -46,10 +47,12 @@ HELP_TEXT = """**ChartVF**
 `;fut ES 15` → E-mini S&P 15-minute chart
 `;fut CL w line` → crude oil weekly line
 `;futures GC 1y` → gold 1-year chart
+Crypto: `;BTC`, `;BTC d`, `;ETH`, `;ETH 1y percent`
+Crypto history: `;BTC max`, `;ETH max`
 Indexes: `;SPX`, `;NDX`, `;DJX`/`;DJI`/`;DJIA`, `;RUT`, `;RUI`, `;VIX`, `;IXIC`, `;OEX`
 
 **Options** (same for stocks and futures)
-Timeframes: stocks support `d`, `w`, `m`, plus intraday `1`, `2`, `3`, `5`, `15`, `30`, `60`, `4h`; futures also support `10`, `2h`
+Timeframes: stocks support `d`, `w`, `m`, plus intraday `1`, `2`, `3`, `5`, `15`, `30`, `60`, `4h`; crypto and futures also support `10`, `2h`
 Types: `candle`, `line`
 Ranges: `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`
 Themes: `dark`, `light`
@@ -59,11 +62,47 @@ Options can be in any order after the ticker.
 
 **Futures** (`;fut`/`;future`/`;futures`): `;f` is still Ford (`F`).
 
-**Freshness**: bare stock and futures commands default to the latest 5-minute chart. Every
-chart image is rendered locally from market chart data.
+**Freshness**: bare stock, futures, and crypto commands default to the latest 5-minute chart.
+Crypto intraday charts use perp data; crypto daily/weekly/monthly and range charts use Binance spot
+OHLCV history. `;BTC max` fetches all available Binance spot chart history. Every chart image is
+rendered locally from market chart data.
 """
 
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=12)
+BINANCE_SPOT_BASE_URL = "https://data-api.binance.vision"
+BINANCE_FUTURES_BASE_URL = "https://fapi.binance.com"
+BINANCE_KLINE_LIMITS = {"spot": 1000, "perp": 1500}
+OKX_BASE_URL = "https://www.okx.com"
+BINANCE_INTERVALS = {
+    "d": "1d",
+    "w": "1w",
+    "m": "1M",
+    "i1": "1m",
+    "i2": "1m",
+    "i3": "3m",
+    "i5": "5m",
+    "i10": "5m",
+    "i15": "15m",
+    "i30": "30m",
+    "h": "1h",
+    "h2": "2h",
+    "h4": "4h",
+}
+OKX_INTERVALS = {
+    "d": "1Dutc",
+    "w": "1Wutc",
+    "m": "1Mutc",
+    "i1": "1m",
+    "i2": "1m",
+    "i3": "3m",
+    "i5": "5m",
+    "i10": "5m",
+    "i15": "15m",
+    "i30": "30m",
+    "h": "1H",
+    "h2": "2H",
+    "h4": "4H",
+}
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -162,7 +201,222 @@ async def fetch_current_day_intraday_quote(session: aiohttp.ClientSession, reque
     }
 
 
+def _binance_interval(request: ChartRequest) -> str:
+    interval = BINANCE_INTERVALS.get(request.timeframe)
+    if interval is None:
+        raise ValueError(f"Binance chart data does not support `{request.timeframe_label}` charts.")
+    return interval
+
+
+def _okx_interval(request: ChartRequest) -> str:
+    interval = OKX_INTERVALS.get(request.timeframe)
+    if interval is None:
+        raise ValueError(f"OKX chart data does not support `{request.timeframe_label}` charts.")
+    return interval
+
+
+def _crypto_auto_market(request: ChartRequest) -> str:
+    if request.crypto_market != "auto":
+        return request.crypto_market or "spot"
+    return "perp" if request.timeframe.startswith(("i", "h")) else "spot"
+
+
+async def _fetch_binance_klines(
+    session: aiohttp.ClientSession,
+    request: ChartRequest,
+    market: str,
+) -> list[list[Any]]:
+    symbol = BINANCE_CRYPTO_SYMBOLS[request.ticker][0]
+    interval = _binance_interval(request)
+    limit = BINANCE_KLINE_LIMITS[market]
+    base_url = BINANCE_FUTURES_BASE_URL if market == "perp" else BINANCE_SPOT_BASE_URL
+    path = "/fapi/v1/klines" if market == "perp" else "/api/v3/klines"
+    rows: list[list[Any]] = []
+    start_time = 0 if request.date_range == "max" else None
+
+    while True:
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+        }
+        if start_time is not None:
+            params["startTime"] = start_time
+        async with session.get(f"{base_url}{path}", params=params, headers={"Accept": "application/json"}) as response:
+            if response.status == 404:
+                raise NoChartData(f"No chart data found for `{request.ticker}`.")
+            if response.status != 200:
+                raise MarketDataProviderError("Market data provider returned an error")
+            data = await response.json(content_type=None)
+        if not isinstance(data, list) or not data:
+            break
+        page = [row for row in data if isinstance(row, list) and len(row) >= 6]
+        rows.extend(page)
+        if request.date_range != "max" or len(data) < limit:
+            break
+        next_start_time = int(page[-1][0]) + 1
+        if next_start_time == start_time:
+            break
+        start_time = next_start_time
+
+    if not rows:
+        raise NoChartData(f"No chart data found for `{request.ticker}`.")
+    return rows
+
+
+async def _fetch_okx_swap_klines(session: aiohttp.ClientSession, request: ChartRequest) -> list[list[Any]]:
+    symbol = BINANCE_CRYPTO_SYMBOLS[request.ticker][0].replace("USDT", "-USDT-SWAP")
+    params: dict[str, Any] = {
+        "instId": symbol,
+        "bar": _okx_interval(request),
+        "limit": 300,
+    }
+    async with session.get(f"{OKX_BASE_URL}/api/v5/market/candles", params=params, headers={"Accept": "application/json"}) as response:
+        if response.status == 404:
+            raise NoChartData(f"No chart data found for `{request.ticker}`.")
+        if response.status != 200:
+            raise MarketDataProviderError("Market data provider returned an error")
+        data = await response.json(content_type=None)
+    if not isinstance(data, dict) or data.get("code") != "0":
+        raise MarketDataProviderError("Market data provider returned an error")
+    rows = data.get("data") or []
+    if not isinstance(rows, list) or not rows:
+        raise NoChartData(f"No chart data found for `{request.ticker}`.")
+    return [row for row in rows if isinstance(row, list) and len(row) >= 7]
+
+
+def _binance_quote_from_klines(
+    rows: list[list[Any]],
+    request: ChartRequest,
+    market: str,
+    source_label: str,
+    display_market: str,
+) -> dict[str, Any]:
+    dates: list[int] = []
+    opens: list[float] = []
+    highs: list[float] = []
+    lows: list[float] = []
+    closes: list[float] = []
+    volumes: list[float] = []
+    close_times: list[int] = []
+    for row in rows:
+        open_time = _safe_float(row[0])
+        close_time = _safe_float(row[6]) if len(row) > 6 else None
+        open_ = _safe_float(row[1])
+        high = _safe_float(row[2])
+        low = _safe_float(row[3])
+        close = _safe_float(row[4])
+        volume = _safe_float(row[5])
+        if open_time is None or open_ is None or high is None or low is None or close is None:
+            continue
+        dates.append(int(open_time // 1000))
+        opens.append(open_ or 0.0)
+        highs.append(high or 0.0)
+        lows.append(low or 0.0)
+        closes.append(close or 0.0)
+        volumes.append(volume or 0.0)
+        close_times.append(int((close_time or open_time) // 1000))
+
+    if len(closes) < 2:
+        raise NoChartData(f"Too little chart data found for `{request.ticker}`.")
+
+    now = int(time.time())
+    last = closes[-1]
+    prev = closes[-2]
+    change = last - prev
+    symbol, display_name = BINANCE_CRYPTO_SYMBOLS[request.ticker]
+    return {
+        "ticker": request.ticker,
+        "name": f"{display_name} {display_market} ({symbol}, {source_label})",
+        "marketLabel": f"{source_label} {display_market}",
+        "date": dates,
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "volume": volumes,
+        "lastClose": last,
+        "lastTime": min(close_times[-1], now),
+        "prevClose": prev,
+        "perfDayUsd": change,
+        "perfDayPct": (change / prev * 100) if prev else None,
+    }
+
+
+def _okx_quote_from_klines(rows: list[list[Any]], request: ChartRequest) -> dict[str, Any]:
+    ordered_rows = sorted(rows, key=lambda row: int(row[0]))
+    dates: list[int] = []
+    opens: list[float] = []
+    highs: list[float] = []
+    lows: list[float] = []
+    closes: list[float] = []
+    volumes: list[float] = []
+    for row in ordered_rows:
+        open_time = _safe_float(row[0])
+        open_ = _safe_float(row[1])
+        high = _safe_float(row[2])
+        low = _safe_float(row[3])
+        close = _safe_float(row[4])
+        base_volume = _safe_float(row[6])
+        if open_time is None or open_ is None or high is None or low is None or close is None:
+            continue
+        dates.append(int(open_time // 1000))
+        opens.append(open_)
+        highs.append(high)
+        lows.append(low)
+        closes.append(close)
+        volumes.append(base_volume or 0.0)
+
+    if len(closes) < 2:
+        raise NoChartData(f"Too little chart data found for `{request.ticker}`.")
+
+    last = closes[-1]
+    prev = closes[-2]
+    change = last - prev
+    _, display_name = BINANCE_CRYPTO_SYMBOLS[request.ticker]
+    inst_id = BINANCE_CRYPTO_SYMBOLS[request.ticker][0].replace("USDT", "-USDT-SWAP")
+    return {
+        "ticker": request.ticker,
+        "name": f"{display_name} perpetual ({inst_id}, OKX)",
+        "marketLabel": "OKX perp",
+        "date": dates,
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "volume": volumes,
+        "lastClose": last,
+        "lastTime": min(dates[-1], int(time.time())),
+        "prevClose": prev,
+        "perfDayUsd": change,
+        "perfDayPct": (change / prev * 100) if prev else None,
+    }
+
+
+async def fetch_binance_crypto_chart_data(session: aiohttp.ClientSession, request: ChartRequest) -> dict[str, Any]:
+    market = _crypto_auto_market(request)
+    try:
+        rows = await _fetch_binance_klines(session, request, market)
+    except (aiohttp.ClientError, TimeoutError, JSONDecodeError, MarketDataProviderError):
+        if market != "perp":
+            raise
+        okx_rows = await _fetch_okx_swap_klines(session, request)
+        quote = _okx_quote_from_klines(okx_rows, request)
+        return aggregate_yahoo_chart_data(quote, request)
+    quote = _binance_quote_from_klines(
+        rows,
+        request,
+        market,
+        "Binance",
+        "perp" if market == "perp" else "spot",
+    )
+    return aggregate_yahoo_chart_data(quote, request)
+
+
 async def fetch_market_chart_data(session: aiohttp.ClientSession, request: ChartRequest) -> dict[str, Any]:
+    if request.crypto_market:
+        return await fetch_binance_crypto_chart_data(session, request)
+
     async with session.get(yahoo_chart_url(request), headers={"Accept": "application/json"}) as response:
         if response.status == 404:
             raise NoChartData(f"No chart data found for `{request.ticker}`.")
@@ -246,7 +500,7 @@ async def send_chart(channel: discord.abc.Messageable, request: ChartRequest) ->
     filename = f"{request.ticker}_{request.timeframe}_{int(time.time())}.png"
     file = discord.File(io.BytesIO(image), filename=filename)
     embed = discord.Embed(
-        title=chart_title(request),
+        title=chart_title(request, str(quote.get("marketLabel")) if quote.get("marketLabel") else None),
         description=description,
         color=0x2ECC71 if (_safe_float(quote.get("perfDayUsd")) or 0.0) >= 0 else 0xFF5252,
     )

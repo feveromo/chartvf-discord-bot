@@ -164,6 +164,7 @@ WEEKLY_SMA_FETCH_RANGES = {
     "max": "max",
 }
 YAHOO_AGGREGATE_SECONDS = {
+    "i2": 2 * 60,
     "i3": 3 * 60,
     "i10": 10 * 60,
     "h2": 2 * 60 * 60,
@@ -180,6 +181,19 @@ YAHOO_SYMBOL_ALIASES = {
     "VIX": "^VIX",
     "IXIC": "^IXIC",
     "OEX": "^OEX",
+}
+CRYPTO_TICKER_ALIASES = {
+    "BITCOIN": "BTC",
+    "ETHEREUM": "ETH",
+    "ETHER": "ETH",
+}
+YAHOO_CRYPTO_SYMBOL_ALIASES = {
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
+}
+BINANCE_CRYPTO_SYMBOLS = {
+    "BTC": ("BTCUSDT", "Bitcoin / TetherUS"),
+    "ETH": ("ETHUSDT", "Ethereum / TetherUS"),
 }
 STOCK_INTRADAY_UNSUPPORTED_MESSAGE = (
     "Stock intraday supports `1`, `2`, `3`, `5`, `15`, `30`, `60`, and `4h` "
@@ -218,6 +232,7 @@ class ChartRequest:
     date_range: str = ""
     date_range_label: str = ""
     futures: bool = False
+    crypto_market: str = ""
 
 
 class NoChartData(ValueError):
@@ -251,6 +266,9 @@ def parse_chart_command(content: str) -> ChartRequest | None:
             raise ValueError("Futures root looks wrong. Use roots like `;fut ES`, `;fut CL`, or `;fut 6E`.")
     elif not TICKER_RE.fullmatch(ticker):
         raise ValueError("Ticker looks wrong. Use letters/numbers only, like `;AAPL` or `;BRK-B`.")
+    else:
+        ticker = CRYPTO_TICKER_ALIASES.get(ticker, ticker)
+    is_crypto = not is_futures and ticker in BINANCE_CRYPTO_SYMBOLS
 
     timeframe, timeframe_label = TIMEFRAMES[DEFAULT_TIMEFRAME]
     timeframe_explicit = False
@@ -259,6 +277,7 @@ def parse_chart_command(content: str) -> ChartRequest | None:
     theme, theme_label = THEMES[DEFAULT_THEME]
     scale, scale_label = SCALES[DEFAULT_SCALE]
     date_range = date_range_label = ""
+    crypto_market = "auto" if is_crypto else ""
 
     for raw_option in parts[1:]:
         option = raw_option.lower()
@@ -267,7 +286,7 @@ def parse_chart_command(content: str) -> ChartRequest | None:
             timeframe_explicit = True
         elif option in FUTURES_TIMEFRAMES:
             candidate_timeframe, candidate_label = FUTURES_TIMEFRAMES[option]
-            if is_futures or candidate_timeframe in STOCK_INTRADAY_INTERVALS:
+            if is_futures or is_crypto or candidate_timeframe in STOCK_INTRADAY_INTERVALS:
                 timeframe, timeframe_label = candidate_timeframe, candidate_label
                 timeframe_explicit = True
             else:
@@ -298,13 +317,17 @@ def parse_chart_command(content: str) -> ChartRequest | None:
     return ChartRequest(
         ticker, timeframe, timeframe_label, chart_type, chart_type_label,
         theme, theme_label, scale, scale_label, date_range, date_range_label, is_futures,
+        crypto_market,
     )
 
 
 def yahoo_chart_symbol(request: ChartRequest) -> str:
     if request.futures:
         return f"{request.ticker}=F"
-    return YAHOO_SYMBOL_ALIASES.get(request.ticker, request.ticker)
+    return YAHOO_CRYPTO_SYMBOL_ALIASES.get(
+        request.ticker,
+        YAHOO_SYMBOL_ALIASES.get(request.ticker, request.ticker),
+    )
 
 
 def _yahoo_chart_range(request: ChartRequest) -> str:
@@ -339,7 +362,7 @@ def yahoo_chart_url(request: ChartRequest) -> str:
     return f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?" + urlencode(params)
 
 
-def chart_title(request: ChartRequest) -> str:
+def chart_title(request: ChartRequest, market_label: str | None = None) -> str:
     parts = [request.ticker]
     if request.date_range_label:
         parts.append(request.date_range_label)
@@ -349,6 +372,8 @@ def chart_title(request: ChartRequest) -> str:
         parts.append(request.scale_label)
     if request.theme != DEFAULT_THEME:
         parts.append(request.theme_label)
+    if market_label is not None:
+        parts.append(market_label)
     if request.futures:
         parts.append("futures")
     return " · ".join(parts)
@@ -940,7 +965,7 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     x_positions = _chart_x_positions(len(candles), left, plot_w)
     if intraday and request.futures:
         session_bands = _futures_globex_session_bands(rows, x_positions, left, plot_right)
-    elif intraday:
+    elif intraday and not request.crypto_market:
         session_bands = _stock_extended_session_bands(rows, x_positions, left, plot_right)
     else:
         session_bands = []
@@ -1217,6 +1242,8 @@ def _fmt_volume(value: Any) -> str:
 
 
 def _header_volume_label(row: ChartRow, request: ChartRequest) -> str:
+    if request.crypto_market:
+        return _fmt_volume(row[5])
     if (
         _source_interval_seconds(request) is not None
         and row[5] == 0

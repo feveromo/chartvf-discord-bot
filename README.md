@@ -27,6 +27,10 @@ Options can be in any order after the ticker.
 | `;AAPL w 5y` | 5-year weekly chart |
 | `;AAPL dark log` | dark theme, log scale |
 | `;AAPL percent` | percent scale |
+| `;BTC d` | Bitcoin daily chart |
+| `;ETH 1y percent` | Ethereum 1-year percent chart |
+| `;BTC 5` | Bitcoin 5-minute perpetual chart |
+| `;BTC max` | full available Binance spot Bitcoin chart history with volume |
 | `;fut ES` | E-mini S&P futures |
 | `;fut ES 15` | 15-minute futures |
 | `;fut CL w line` | crude oil weekly line chart |
@@ -40,13 +44,15 @@ Options can be in any order after the ticker.
 
 | Option | Values |
 | --- | --- |
-| Timeframes | stocks: `d`, `w`, `m`, `1`, `2`, `3`, `5`, `15`, `30`, `60`, `4h`; futures also: `10`, `2h` |
+| Timeframes | stocks: `d`, `w`, `m`, `1`, `2`, `3`, `5`, `15`, `30`, `60`, `4h`; crypto and futures also: `10`, `2h` |
 | Chart types | `candle`, `line` |
 | Ranges | `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max` |
 | Themes | `light`, `dark` |
 | Scales | `linear`, `log`, `percent` |
 
-Bare stock commands default to the latest 5-minute chart.
+Bare stock and crypto commands default to the latest 5-minute chart. Crypto intraday charts use
+perpetual data; crypto daily/weekly/monthly and range charts use Binance spot OHLCV history.
+Use `;BTC max` for full available Binance spot history with volume.
 
 ## Futures
 
