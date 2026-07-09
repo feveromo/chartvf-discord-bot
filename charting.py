@@ -186,14 +186,17 @@ CRYPTO_TICKER_ALIASES = {
     "BITCOIN": "BTC",
     "ETHEREUM": "ETH",
     "ETHER": "ETH",
+    "DOGECOIN": "DOGE",
 }
 YAHOO_CRYPTO_SYMBOL_ALIASES = {
     "BTC": "BTC-USD",
     "ETH": "ETH-USD",
+    "DOGE": "DOGE-USD",
 }
 BINANCE_CRYPTO_SYMBOLS = {
     "BTC": ("BTCUSDT", "Bitcoin / TetherUS"),
     "ETH": ("ETHUSDT", "Ethereum / TetherUS"),
+    "DOGE": ("DOGEUSDT", "Dogecoin / TetherUS"),
 }
 STOCK_INTRADAY_UNSUPPORTED_MESSAGE = (
     "Stock intraday supports `1`, `2`, `3`, `5`, `15`, `30`, `60`, and `4h` "

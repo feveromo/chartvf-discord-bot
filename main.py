@@ -47,8 +47,8 @@ HELP_TEXT = """**ChartVF**
 `;fut ES 15` → E-mini S&P 15-minute chart
 `;fut CL w line` → crude oil weekly line
 `;futures GC 1y` → gold 1-year chart
-Crypto: `;BTC`, `;BTC d`, `;ETH`, `;ETH 1y percent`
-Crypto history: `;BTC max`, `;ETH max`
+Crypto: `;BTC`, `;BTC d`, `;ETH`, `;ETH 1y percent`, `;DOGE`, `;DOGE d`
+Crypto history: `;BTC max`, `;ETH max`, `;DOGE max`
 Indexes: `;SPX`, `;NDX`, `;DJX`/`;DJI`/`;DJIA`, `;RUT`, `;RUI`, `;VIX`, `;IXIC`, `;OEX`
 
 **Options** (same for stocks and futures)

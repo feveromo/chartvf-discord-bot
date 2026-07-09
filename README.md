@@ -29,6 +29,7 @@ Options can be in any order after the ticker.
 | `;AAPL percent` | percent scale |
 | `;BTC d` | Bitcoin daily chart |
 | `;ETH 1y percent` | Ethereum 1-year percent chart |
+| `;DOGE d` | Dogecoin daily chart |
 | `;BTC 5` | Bitcoin 5-minute perpetual chart |
 | `;BTC max` | full available Binance spot Bitcoin chart history with volume |
 | `;fut ES` | E-mini S&P futures |

@@ -156,6 +156,12 @@ def test_charting_regressions() -> None:
         date_range_label="1 year",
         crypto_market="auto",
     )
+    assert parse_chart_command(";dogecoin d") == ChartRequest(
+        "DOGE",
+        "d",
+        "daily",
+        crypto_market="auto",
+    )
     assert parse_chart_command(";btc 5") == ChartRequest(
         "BTC",
         "i5",
@@ -172,14 +178,15 @@ def test_charting_regressions() -> None:
     )
     assert chart_title(parse_chart_command(";btc d") or ChartRequest("BTC")) == "BTC · daily candles"
     assert chart_title(parse_chart_command(";btc 5") or ChartRequest("BTC")) == "BTC · 5 min candles"
-    for terse_crypto_command in (";btc", ";btc 1", ";btc 2", ";btc 3", ";btc 5", ";btc 10", ";btc 15", ";btc 30", ";btc 60", ";btc 2h", ";btc 4h", ";eth 15"):
+    for terse_crypto_command in (";btc", ";btc 1", ";btc 2", ";btc 3", ";btc 5", ";btc 10", ";btc 15", ";btc 30", ";btc 60", ";btc 2h", ";btc 4h", ";eth 15", ";doge 5"):
         req = parse_chart_command(terse_crypto_command)
         assert req is not None and req.crypto_market == "auto" and req.timeframe.startswith(("i", "h"))
-    for longer_crypto_command in (";btc d", ";btc w", ";btc m", ";btc 1y", ";btc max", ";eth w"):
+    for longer_crypto_command in (";btc d", ";btc w", ";btc m", ";btc 1y", ";btc max", ";eth w", ";doge d"):
         req = parse_chart_command(longer_crypto_command)
         assert req is not None and req.crypto_market == "auto" and not req.timeframe.startswith(("i", "h"))
     assert "BTC-USD" in yahoo_chart_url(ChartRequest("BTC", "d", "daily"))
     assert "ETH-USD" in yahoo_chart_url(ChartRequest("ETH", "d", "daily"))
+    assert "DOGE-USD" in yahoo_chart_url(ChartRequest("DOGE", "d", "daily"))
     assert "range=2y" in yahoo_chart_url(ChartRequest("AMD", "d", "daily", date_range="y1"))
     assert "interval=1wk" in yahoo_chart_url(ChartRequest("AMD", "w", "weekly"))
     assert "range=10y" in yahoo_chart_url(ChartRequest("AMD", "w", "weekly"))
