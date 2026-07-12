@@ -1,6 +1,7 @@
 import datetime as dt
 import io
 import math
+from typing import Any
 
 from charting import (
     CHART_RIGHT_MARGIN,
@@ -18,6 +19,7 @@ from charting import (
     STOCK_MONTHLY_VISIBLE_BARS,
     STOCK_WEEKLY_VISIBLE_BARS,
     YAHOO_SYMBOL_ALIASES,
+    ChartData,
     ChartRequest,
     _blend_rgb,
     _chart_x_positions,
@@ -27,27 +29,80 @@ from charting import (
     _futures_globex_session_bands,
     _futures_globex_session_key,
     _header_volume_label,
-    _latest_quote_price_time,
+    _chart_rows as chart_rows,
     _month_tick_label,
     _nice_linear_axis,
-    _patch_close_only_latest_ohlc,
-    _quote_rows,
     _source_interval_seconds,
     _stock_5m_today_indexes,
     _stock_extended_session_bands,
     _stock_extended_session_key,
-    _stock_previous_close,
     _visible_indexes,
     _volume_axis,
     _volume_scale_value,
     _x_grid_line_styles,
-    aggregate_yahoo_chart_data,
+    aggregate_chart_data,
     chart_title,
     parse_chart_command,
-    quote_description,
-    render_price_chart_png,
+    latest_quote_price_time,
+    normalize_chart_rows,
+    patch_close_only_latest_ohlc,
+    quote_description as describe_chart_data,
+    render_price_chart_png as render_chart_data_png,
+    safe_float,
+    stock_previous_close,
     yahoo_chart_url,
 )
+
+
+def _chart_data(raw: dict[str, Any]) -> ChartData:
+    dates = list(raw.get("date") or [])
+    opens = list(raw.get("open") or [])
+    highs = list(raw.get("high") or [])
+    lows = list(raw.get("low") or [])
+    closes = list(raw.get("close") or [])
+    volumes = list(raw.get("volume") or [])
+    last_close = safe_float(raw.get("lastClose"))
+    return ChartData(
+        ticker=str(raw.get("ticker") or "TEST"),
+        name=str(raw.get("name") or raw.get("ticker") or "TEST"),
+        rows=normalize_chart_rows(
+            dates,
+            opens,
+            highs,
+            lows,
+            closes,
+            volumes,
+            last_close=last_close,
+        ),
+        last_close=last_close,
+        last_time=int(last_time) if (last_time := safe_float(raw.get("lastTime"))) is not None else None,
+        previous_close=safe_float(raw.get("prevClose")),
+        change=safe_float(raw.get("perfDayUsd")),
+        change_percent=safe_float(raw.get("perfDayPct")),
+        market_label=str(raw.get("marketLabel") or ""),
+        futures=bool(raw.get("futures")),
+    )
+
+
+def _quote_rows(raw: dict[str, Any], request: ChartRequest) -> list[tuple[int, float, float, float, float, float]]:
+    return list(chart_rows(_chart_data(raw), request))
+
+
+def aggregate_yahoo_chart_data(raw: dict[str, Any], request: ChartRequest) -> ChartData:
+    return aggregate_chart_data(_chart_data(raw), request)
+
+
+def render_price_chart_png(raw: dict[str, Any], request: ChartRequest) -> bytes:
+    return render_chart_data_png(_chart_data(raw), request)
+
+
+def quote_description(raw: dict[str, Any]) -> str:
+    return describe_chart_data(_chart_data(raw))
+
+
+_latest_quote_price_time = latest_quote_price_time
+_patch_close_only_latest_ohlc = patch_close_only_latest_ohlc
+_stock_previous_close = stock_previous_close
 
 
 def test_charting_regressions() -> None:
@@ -393,7 +448,8 @@ def test_charting_regressions() -> None:
         regular_futures_rows,
         ChartRequest("ES", "i5", "5 min", futures=True),
     )[0][2] == 125.0
-    mixed_session_rows = futures_wick_rows + [
+    mixed_session_rows = [
+        *futures_wick_rows,
         (et_epoch(10, 0), 124.0, 125.0, 123.0, 124.5, 1.0),
     ]
     mixed_cleaned = _clean_futures_intraday_wicks(
@@ -443,12 +499,12 @@ def test_charting_regressions() -> None:
         "close": [10.5, 11.5, 12.5, 13.5],
         "volume": [1, 2, 3, 4],
     }, ChartRequest("ES", "i3", "3 min", futures=True))
-    assert aggregated["date"] == [0, 180]
-    assert aggregated["open"] == [10.0, 13.0]
-    assert aggregated["high"] == [13.0, 14.0]
-    assert aggregated["low"] == [9.0, 12.0]
-    assert aggregated["close"] == [12.5, 13.5]
-    assert aggregated["volume"] == [6.0, 4.0]
+    assert [row.epoch for row in aggregated.rows] == [0, 180]
+    assert [row.open for row in aggregated.rows] == [10.0, 13.0]
+    assert [row.high for row in aggregated.rows] == [13.0, 14.0]
+    assert [row.low for row in aggregated.rows] == [9.0, 12.0]
+    assert [row.close for row in aggregated.rows] == [12.5, 13.5]
+    assert [row.volume for row in aggregated.rows] == [6.0, 4.0]
     stock_aggregated = aggregate_yahoo_chart_data({
         "ticker": "AMD",
         "date": [0, 60, 120, 180],
@@ -458,12 +514,12 @@ def test_charting_regressions() -> None:
         "close": [10.5, 11.5, 12.5, 13.5],
         "volume": [1, 2, 3, 4],
     }, ChartRequest("AMD", "i3", "3 min"))
-    assert stock_aggregated["date"] == [0, 180]
-    assert stock_aggregated["open"] == [10.0, 13.0]
-    assert stock_aggregated["high"] == [13.0, 14.0]
-    assert stock_aggregated["low"] == [9.0, 12.0]
-    assert stock_aggregated["close"] == [12.5, 13.5]
-    assert stock_aggregated["volume"] == [6.0, 4.0]
+    assert [row.epoch for row in stock_aggregated.rows] == [0, 180]
+    assert [row.open for row in stock_aggregated.rows] == [10.0, 13.0]
+    assert [row.high for row in stock_aggregated.rows] == [13.0, 14.0]
+    assert [row.low for row in stock_aggregated.rows] == [9.0, 12.0]
+    assert [row.close for row in stock_aggregated.rows] == [12.5, 13.5]
+    assert [row.volume for row in stock_aggregated.rows] == [6.0, 4.0]
     assert parse_chart_command(";fut 6e") == ChartRequest("6E", "i5", "5 min", futures=True)
     sample_png = render_price_chart_png({
         "ticker": "ES",

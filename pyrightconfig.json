@@ -1,5 +1,5 @@
 {
-  "include": ["main.py", "charting.py"],
+  "include": ["main.py", "charting.py", "test_charting.py", "test_main.py", "test_rendering.py"],
   "pythonVersion": "3.14",
   "venv": ".venv",
   "venvPath": "."

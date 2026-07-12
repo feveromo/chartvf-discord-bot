@@ -1,6 +1,6 @@
 # ChartVF
 
-A tiny Discord chart bot for stocks and futures. It renders local PNG charts from market data:
+A tiny Discord chart bot for stocks, futures, and crypto. It renders local PNG charts from market data:
 candles, volume, SMA20/50/200, regular/extended sessions where they make sense, and simple line charts.
 Nothing else.
 
@@ -53,7 +53,8 @@ Options can be in any order after the ticker.
 
 Bare stock and crypto commands default to the latest 5-minute chart. Crypto intraday charts use
 perpetual data; crypto daily/weekly/monthly and range charts use Binance spot OHLCV history.
-Use `;BTC max` for full available Binance spot history with volume.
+Crypto embeds show rolling 24-hour price changes consistently across timeframes. Use `;BTC max`
+for full available Binance spot history with volume.
 
 ## Futures
 
@@ -87,7 +88,12 @@ This bot is a long-running Discord worker, not an HTTP web service, so it does n
 ## Checks
 
 ```bash
+pip install -r requirements.txt -r requirements-dev.txt
 python test_charting.py
-python -m py_compile main.py charting.py test_charting.py
-pyright --pythonpath .venv/bin/python main.py charting.py test_charting.py  # optional
+python test_main.py
+python test_rendering.py
+python -m py_compile main.py charting.py test_charting.py test_main.py test_rendering.py
+pyright --pythonpath .venv/bin/python main.py charting.py test_charting.py test_main.py test_rendering.py
+ruff check main.py charting.py test_charting.py test_main.py test_rendering.py
+pip check
 ```

@@ -1,0 +1,23 @@
+name: checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: python test_charting.py
+      - run: python test_main.py
+      - run: python test_rendering.py
+      - run: python -m py_compile main.py charting.py test_charting.py test_main.py test_rendering.py
+      - run: pyright --pythonpath "$(command -v python)" main.py charting.py test_charting.py test_main.py test_rendering.py
+      - run: ruff check main.py charting.py test_charting.py test_main.py test_rendering.py
+      - run: pip check

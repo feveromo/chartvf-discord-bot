@@ -2,11 +2,15 @@ import datetime as dt
 import io
 import math
 import re
-from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
+from functools import lru_cache
+from itertools import pairwise
+from typing import Any, Literal, NamedTuple
 from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
+
+from PIL import Image, ImageDraw, ImageFont
 
 PREFIX = ";"
 DEFAULT_TIMEFRAME = "d"
@@ -221,7 +225,10 @@ FUTURES_DISPLAY_NAMES = {
 }
 
 
-@dataclass(frozen=True)
+CryptoMarket = Literal["", "auto", "spot", "perp"]
+
+
+@dataclass(frozen=True, slots=True)
 class ChartRequest:
     ticker: str
     timeframe: str = DEFAULT_TIMEFRAME
@@ -235,7 +242,34 @@ class ChartRequest:
     date_range: str = ""
     date_range_label: str = ""
     futures: bool = False
-    crypto_market: str = ""
+    crypto_market: CryptoMarket = ""
+
+
+class ChartRow(NamedTuple):
+    epoch: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+ChartRowValues = tuple[int, float, float, float, float, float]
+
+
+@dataclass(frozen=True, slots=True)
+class ChartData:
+    ticker: str
+    name: str
+    rows: tuple[ChartRow, ...]
+    last_close: float | None = None
+    last_time: int | None = None
+    previous_close: float | None = None
+    change: float | None = None
+    change_percent: float | None = None
+    market_label: str = ""
+    futures: bool = False
+    source_interval_seconds: int | None = None
 
 
 class NoChartData(ValueError):
@@ -382,11 +416,10 @@ def chart_title(request: ChartRequest, market_label: str | None = None) -> str:
     return " · ".join(parts)
 
 
-ChartRow = tuple[int, float, float, float, float, float]
 SessionKey = tuple[str, object]
 
 
-def _safe_float(value: Any) -> float | None:
+def safe_float(value: Any) -> float | None:
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -420,7 +453,7 @@ def _collapse_monthly_rows(rows: list[ChartRow]) -> list[ChartRow]:
         month = (stamp.year, stamp.month)
         if month == last_month:
             _, prev_open, prev_high, prev_low, _, prev_volume = collapsed[-1]
-            collapsed[-1] = (
+            collapsed[-1] = ChartRow(
                 epoch,
                 prev_open,
                 max(prev_high, high),
@@ -429,7 +462,7 @@ def _collapse_monthly_rows(rows: list[ChartRow]) -> list[ChartRow]:
                 prev_volume + volume,
             )
             continue
-        collapsed.append((epoch, open_, high, low, close, volume))
+        collapsed.append(ChartRow(epoch, open_, high, low, close, volume))
         last_month = month
     return collapsed
 
@@ -443,8 +476,12 @@ def _source_interval_seconds(request: ChartRequest) -> int | None:
     return None
 
 
-def _drop_live_quote_row(rows: list[ChartRow], request: ChartRequest) -> list[ChartRow]:
-    interval = _source_interval_seconds(request)
+def _drop_live_quote_row(
+    rows: list[ChartRow],
+    request: ChartRequest,
+    source_interval_seconds: int | None = None,
+) -> list[ChartRow]:
+    interval = source_interval_seconds or _source_interval_seconds(request)
     if interval is None or len(rows) < 2:
         return rows
     epoch, open_, high, low, close, volume = rows[-1]
@@ -464,7 +501,7 @@ def _drop_live_quote_row(rows: list[ChartRow], request: ChartRequest) -> list[Ch
     return rows
 
 
-def _has_close_only_latest_ohlc(quote: dict[str, Any]) -> bool:
+def has_close_only_latest_ohlc(quote: dict[str, Any]) -> bool:
     opens = quote.get("open") or []
     highs = quote.get("high") or []
     lows = quote.get("low") or []
@@ -473,13 +510,13 @@ def _has_close_only_latest_ohlc(quote: dict[str, Any]) -> bool:
     if row_count == 0:
         return False
     last = row_count - 1
-    o, h, l = (_safe_float(values[last]) for values in (opens, highs, lows))
-    c = _safe_float(closes[last])
-    return c is not None and c > 0 and o == h == l == 0
+    open_, high, low = (safe_float(values[last]) for values in (opens, highs, lows))
+    close = safe_float(closes[last])
+    return close is not None and close > 0 and open_ == high == low == 0
 
 
-def _patch_close_only_latest_ohlc(quote: dict[str, Any], intraday_quote: dict[str, Any]) -> dict[str, Any]:
-    if not _has_close_only_latest_ohlc(quote):
+def patch_close_only_latest_ohlc(quote: dict[str, Any], intraday_quote: dict[str, Any]) -> dict[str, Any]:
+    if not has_close_only_latest_ohlc(quote):
         return quote
 
     intraday_opens = intraday_quote.get("open") or []
@@ -488,12 +525,15 @@ def _patch_close_only_latest_ohlc(quote: dict[str, Any], intraday_quote: dict[st
     intraday_closes = intraday_quote.get("close") or []
     intraday_rows: list[tuple[float, float, float, float]] = []
     for i in range(min(map(len, (intraday_opens, intraday_highs, intraday_lows, intraday_closes)))):
-        o, h, l, c = (_safe_float(values[i]) for values in (intraday_opens, intraday_highs, intraday_lows, intraday_closes))
-        if o is None or h is None or l is None or c is None or h < l:
+        open_, high, low, close = (
+            safe_float(values[i])
+            for values in (intraday_opens, intraday_highs, intraday_lows, intraday_closes)
+        )
+        if open_ is None or high is None or low is None or close is None or high < low:
             continue
-        if c > 0 and o == h == l == 0:
+        if close > 0 and open_ == high == low == 0:
             continue
-        intraday_rows.append((o, h, l, c))
+        intraday_rows.append((open_, high, low, close))
     if not intraday_rows:
         return quote
 
@@ -503,7 +543,7 @@ def _patch_close_only_latest_ohlc(quote: dict[str, Any], intraday_quote: dict[st
     closes = quote.get("close") or []
     row_count = min(map(len, (opens, highs, lows, closes)))
     last = row_count - 1
-    close = _safe_float(closes[last])
+    close = safe_float(closes[last])
     if close is None:
         return quote
 
@@ -523,28 +563,43 @@ def _patch_close_only_latest_ohlc(quote: dict[str, Any], intraday_quote: dict[st
     return patched
 
 
-def _quote_rows(quote: dict[str, Any], request: ChartRequest) -> list[ChartRow]:
-    dates = quote.get("date") or []
-    opens = quote.get("open") or []
-    highs = quote.get("high") or []
-    lows = quote.get("low") or []
-    closes = quote.get("close") or []
-    volumes = quote.get("volume") or []
+def normalize_chart_rows(
+    dates: list[Any],
+    opens: list[Any],
+    highs: list[Any],
+    lows: list[Any],
+    closes: list[Any],
+    volumes: list[Any],
+    *,
+    last_close: float | None = None,
+) -> tuple[ChartRow, ...]:
     rows: list[ChartRow] = []
-    last_close = _safe_float(quote.get("lastClose"))
     row_count = min(map(len, (dates, opens, highs, lows, closes)))
     for i in range(row_count):
-        o, h, l = (_safe_float(values[i]) for values in (opens, highs, lows))
-        c = _safe_float(closes[i])
-        if c is None and i == row_count - 1:
-            c = last_close
-        if o is None or h is None or l is None or c is None:
+        open_, high, low = (safe_float(values[i]) for values in (opens, highs, lows))
+        close = safe_float(closes[i])
+        if close is None and i == row_count - 1:
+            close = last_close
+        if open_ is None or high is None or low is None or close is None:
             continue
-        if c > 0 and o == h == l == 0:
-            o = h = l = c
-        v = _safe_float(volumes[i]) if i < len(volumes) else 0.0
-        rows.append((int(dates[i]), o or 0.0, h or 0.0, l or 0.0, c or 0.0, v or 0.0))
-    rows = _drop_live_quote_row(rows, request)
+        if close > 0 and open_ == high == low == 0:
+            open_ = high = low = close
+        volume = safe_float(volumes[i]) if i < len(volumes) else 0.0
+        rows.append(
+            ChartRow(
+                int(dates[i]),
+                open_ or 0.0,
+                high or 0.0,
+                low or 0.0,
+                close or 0.0,
+                volume or 0.0,
+            )
+        )
+    return tuple(rows)
+
+
+def _chart_rows(data: ChartData, request: ChartRequest) -> list[ChartRow]:
+    rows = _drop_live_quote_row(list(data.rows), request, data.source_interval_seconds)
     if request.timeframe == "m":
         rows = _collapse_monthly_rows(rows)
     if not rows:
@@ -552,19 +607,22 @@ def _quote_rows(quote: dict[str, Any], request: ChartRequest) -> list[ChartRow]:
     return rows
 
 
-def aggregate_yahoo_chart_data(quote: dict[str, Any], request: ChartRequest) -> dict[str, Any]:
+def aggregate_chart_data(data: ChartData, request: ChartRequest) -> ChartData:
     bucket_seconds = YAHOO_AGGREGATE_SECONDS.get(request.timeframe)
-    if bucket_seconds is None:
-        return quote
+    if bucket_seconds is None or (
+        data.source_interval_seconds is not None
+        and data.source_interval_seconds >= bucket_seconds
+    ):
+        return data
 
     buckets: list[ChartRow] = []
-    for epoch, open_, high, low, close, volume in _quote_rows(quote, request):
+    for epoch, open_, high, low, close, volume in _chart_rows(data, request):
         bucket_epoch = (epoch // bucket_seconds) * bucket_seconds
         if not buckets or buckets[-1][0] != bucket_epoch:
-            buckets.append((bucket_epoch, open_, high, low, close, volume))
+            buckets.append(ChartRow(bucket_epoch, open_, high, low, close, volume))
             continue
         prev_epoch, prev_open, prev_high, prev_low, _, prev_volume = buckets[-1]
-        buckets[-1] = (
+        buckets[-1] = ChartRow(
             prev_epoch,
             prev_open,
             max(prev_high, high),
@@ -573,17 +631,10 @@ def aggregate_yahoo_chart_data(quote: dict[str, Any], request: ChartRequest) -> 
             prev_volume + volume,
         )
 
-    aggregated = dict(quote)
-    aggregated["date"] = [row[0] for row in buckets]
-    aggregated["open"] = [row[1] for row in buckets]
-    aggregated["high"] = [row[2] for row in buckets]
-    aggregated["low"] = [row[3] for row in buckets]
-    aggregated["close"] = [row[4] for row in buckets]
-    aggregated["volume"] = [row[5] for row in buckets]
-    return aggregated
+    return replace(data, rows=tuple(buckets), source_interval_seconds=bucket_seconds)
 
 
-def _stock_5m_today_indexes(rows: list[ChartRow], request: ChartRequest) -> list[int] | None:
+def _stock_5m_today_indexes(rows: Sequence[ChartRowValues], request: ChartRequest) -> list[int] | None:
     if request.futures or request.timeframe != "i5" or request.date_range:
         return None
     last_local = dt.datetime.fromtimestamp(rows[-1][0], dt.timezone.utc).astimezone(MARKET_TIME_ZONE)
@@ -599,7 +650,7 @@ def _stock_5m_today_indexes(rows: list[ChartRow], request: ChartRequest) -> list
     return same_day if len(same_day) >= SPARSE_CHART_MIN_BARS else None
 
 
-def _visible_indexes(rows: list[ChartRow], request: ChartRequest) -> list[int]:
+def _visible_indexes(rows: Sequence[ChartRowValues], request: ChartRequest) -> list[int]:
     today_indexes = _stock_5m_today_indexes(rows, request)
     if today_indexes is not None:
         indexes = today_indexes
@@ -647,7 +698,7 @@ def _futures_globex_session_key(epoch: int) -> SessionKey | None:
 
 
 def _extended_session_bands(
-    rows: list[ChartRow],
+    rows: Sequence[ChartRowValues],
     x_positions: list[int],
     left: int,
     plot_right: int,
@@ -678,7 +729,7 @@ def _extended_session_bands(
 
 
 def _stock_extended_session_bands(
-    rows: list[ChartRow],
+    rows: Sequence[ChartRowValues],
     x_positions: list[int],
     left: int,
     plot_right: int,
@@ -687,7 +738,7 @@ def _stock_extended_session_bands(
 
 
 def _futures_globex_session_bands(
-    rows: list[ChartRow],
+    rows: Sequence[ChartRowValues],
     x_positions: list[int],
     left: int,
     plot_right: int,
@@ -695,9 +746,12 @@ def _futures_globex_session_bands(
     return _extended_session_bands(rows, x_positions, left, plot_right, _futures_globex_session_key)
 
 
-def _clean_stock_extended_wicks(rows: list[ChartRow], request: ChartRequest) -> list[ChartRow]:
+def _clean_stock_extended_wicks(
+    rows: Sequence[ChartRowValues],
+    request: ChartRequest,
+) -> list[ChartRowValues]:
     if request.futures or not request.timeframe.startswith(("i", "h")):
-        return rows
+        return list(rows)
     regular_ranges = sorted(
         max(0.0, row[2] - row[3])
         for row in rows
@@ -705,7 +759,7 @@ def _clean_stock_extended_wicks(rows: list[ChartRow], request: ChartRequest) -> 
     )
     typical_range = regular_ranges[len(regular_ranges) // 2] if regular_ranges else 0.0
     threshold = max(abs(rows[-1][4]) * EXTENDED_WICK_PCT_LIMIT, typical_range * EXTENDED_WICK_RANGE_MULTIPLE, 0.0001)
-    cleaned: list[ChartRow] = []
+    cleaned: list[ChartRowValues] = []
     for epoch, open_, high, low, close, volume in rows:
         body_high = max(open_, close)
         body_low = min(open_, close)
@@ -714,7 +768,7 @@ def _clean_stock_extended_wicks(rows: list[ChartRow], request: ChartRequest) -> 
                 low = body_low
             if high - body_high > threshold:
                 high = body_high
-        cleaned.append((epoch, open_, max(high, body_high), min(low, body_low), close, volume))
+        cleaned.append(ChartRow(epoch, open_, max(high, body_high), min(low, body_low), close, volume))
     return cleaned
 
 
@@ -722,9 +776,12 @@ def _price_key(value: float) -> float:
     return round(value, 8)
 
 
-def _clean_futures_intraday_wicks(rows: list[ChartRow], request: ChartRequest) -> list[ChartRow]:
+def _clean_futures_intraday_wicks(
+    rows: Sequence[ChartRowValues],
+    request: ChartRequest,
+) -> list[ChartRowValues]:
     if not request.futures or not request.timeframe.startswith(("i", "h")):
-        return rows
+        return list(rows)
     ranges = sorted(max(0.0, row[2] - row[3]) for row in rows if row[2] >= row[3])
     typical_range = ranges[len(ranges) // 2] if ranges else 0.0
     threshold = max(abs(rows[-1][4]) * 0.0004, typical_range * FUTURES_STALE_WICK_RANGE_MULTIPLE, 0.0001)
@@ -756,9 +813,9 @@ def _clean_futures_intraday_wicks(rows: list[ChartRow], request: ChartRequest) -
         if count >= FUTURES_STALE_EXTREME_MIN_REPEATS and low_flags.get(value, 0) >= FUTURES_STALE_EXTREME_MIN_FLAGS
     }
     if not stale_highs and not stale_lows:
-        return rows
+        return list(rows)
 
-    cleaned: list[ChartRow] = []
+    cleaned: list[ChartRowValues] = []
     for epoch, open_, high, low, close, volume in rows:
         body_high = max(open_, close)
         body_low = min(open_, close)
@@ -767,7 +824,7 @@ def _clean_futures_intraday_wicks(rows: list[ChartRow], request: ChartRequest) -
                 high = body_high
             if _price_key(low) in stale_lows and low < body_low:
                 low = body_low
-        cleaned.append((epoch, open_, max(high, body_high), min(low, body_low), close, volume))
+        cleaned.append(ChartRow(epoch, open_, max(high, body_high), min(low, body_low), close, volume))
     return cleaned
 
 
@@ -779,7 +836,7 @@ def _chart_x_positions(count: int, left: int, plot_w: int) -> list[int]:
     return [left + round(pos * (plot_w - 1) / max(count - 1, 1)) for pos in range(count)]
 
 
-def _sma_values(rows: list[ChartRow], period: int) -> list[float | None]:
+def _sma_values(rows: Sequence[ChartRowValues], period: int) -> list[float | None]:
     values: list[float | None] = []
     total = 0.0
     for i, row in enumerate(rows):
@@ -844,7 +901,7 @@ def _volume_axis(value: float, request: ChartRequest) -> tuple[float, list[float
     return high, ticks
 
 
-def _volume_scale_value(rows: list[ChartRow], request: ChartRequest) -> float:
+def _volume_scale_value(rows: Sequence[ChartRowValues], request: ChartRequest) -> float:
     values = sorted(row[5] for row in rows if row[5] > 0)
     return values[-1] if values else 0
 
@@ -870,9 +927,32 @@ def _x_grid_line_styles(x_ticks: list[tuple[int, str]], quarterly_grid: bool) ->
     return [(idx, position % 3 == 0) for position, (idx, _) in enumerate(x_ticks)]
 
 
-def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> bytes:
+@lru_cache(maxsize=None)
+def _font(size: int, bold: bool = False) -> Any:
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    for path in (f"/usr/share/fonts/truetype/dejavu/{name}", name):
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+@lru_cache(maxsize=None)
+def _date_font(size: int) -> Any:
+    for path in (
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/opentype/urw-base35/NimbusSans-Regular.otf",
+    ):
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return _font(size)
+
+
+def render_price_chart_png(data: ChartData, request: ChartRequest) -> bytes:
     # Pillow keeps text crisp without pulling in a full charting framework.
-    from PIL import Image, ImageDraw, ImageFont
 
     width, height = DEFAULT_WIDTH * DEFAULT_SCALE_FACTOR, DEFAULT_HEIGHT * DEFAULT_SCALE_FACTOR
     dark = request.theme == "dark"
@@ -895,33 +975,13 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     sma_alpha = 0.82 if dark else 0.72
     sma_colors = {period: _blend_rgb(SMA_COLORS[period], bg, sma_alpha) for period in SMA_PERIODS}
 
-    def font(size: int, bold: bool = False) -> Any:
-        name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
-        for path in (f"/usr/share/fonts/truetype/dejavu/{name}", name):
-            try:
-                return ImageFont.truetype(path, size)
-            except OSError:
-                pass
-        return ImageFont.load_default()
-
-    def date_font(size: int) -> Any:
-        for path in (
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/opentype/urw-base35/NimbusSans-Regular.otf",
-        ):
-            try:
-                return ImageFont.truetype(path, size)
-            except OSError:
-                pass
-        return font(size)
-
-    header_font = font(18)
-    label_font = font(17, True)
-    axis_font = font(18)
-    date_axis_font = date_font(11)
-    small_font = font(14)
-    badge_font = font(17, True)
-    sma_font = font(16)
+    header_font = _font(18)
+    label_font = _font(17, True)
+    axis_font = _font(18)
+    date_axis_font = _date_font(11)
+    small_font = _font(14)
+    badge_font = _font(17, True)
+    sma_font = _font(16)
 
     image = Image.new("RGB", (width, height), bg)
     draw = ImageDraw.Draw(image)
@@ -932,7 +992,10 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
     price_top, price_bottom = top, vol_top - gap
     plot_right = width - right
     plot_w = plot_right - left
-    all_rows = _clean_futures_intraday_wicks(_clean_stock_extended_wicks(_quote_rows(quote, request), request), request)
+    all_rows = _clean_futures_intraday_wicks(
+        _clean_stock_extended_wicks(_chart_rows(data, request), request),
+        request,
+    )
     indexes = _visible_indexes(all_rows, request)
     rows = [all_rows[i] for i in indexes]
     base = rows[0][4]
@@ -951,8 +1014,15 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
         return value
 
     smas = {period: _sma_values(all_rows, period) for period in SMA_PERIODS}
-    candles = [(i, d, scaled(o), scaled(h), scaled(l), scaled(c), v) for i, (d, o, h, l, c, v) in zip(indexes, rows)]
-    scale_values = [value for _, _, o, h, l, c, _ in candles for value in (o, h, l, c)]
+    candles = [
+        (index, epoch, scaled(open_), scaled(high), scaled(low), scaled(close), volume)
+        for index, (epoch, open_, high, low, close, volume) in zip(indexes, rows, strict=True)
+    ]
+    scale_values = [
+        value
+        for _, _, open_, high, low, close, _ in candles
+        for value in (open_, high, low, close)
+    ]
     low, high = min(scale_values), max(scale_values)
     if high == low:
         high += 1
@@ -1112,23 +1182,35 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
         return left, left + candle_w - 1
 
     close_points: list[tuple[int, int]] = []
-    for pos, (_, _, o, h, l, c, v) in enumerate(candles):
+    for pos, (_, _, open_value, high_value, low_value, close_value, volume) in enumerate(candles):
         x = x_at(pos)
-        color = up if c >= o else down
-        vh = min(vol_bottom - vol_top, round((v / vol_axis_high) * (vol_bottom - vol_top)))
+        color = up if close_value >= open_value else down
+        vh = min(vol_bottom - vol_top, round((volume / vol_axis_high) * (vol_bottom - vol_top)))
         bar_left, bar_right = bar_bounds(x)
-        draw.rectangle((bar_left, vol_bottom - vh, bar_right, vol_bottom), fill=vol_up if c >= o else vol_down)
+        draw.rectangle(
+            (bar_left, vol_bottom - vh, bar_right, vol_bottom),
+            fill=vol_up if close_value >= open_value else vol_down,
+        )
         if request.chart_type == "l":
-            close_points.append((x, y_at(c)))
+            close_points.append((x, y_at(close_value)))
             continue
-        yo, yh, yl, yc = y_at(o), y_at(h), y_at(l), y_at(c)
-        draw.line((x, yh, x, yl), fill=color, width=1)
-        draw.rectangle((bar_left, min(yo, yc), bar_right, max(yo, yc)), fill=color)
+        open_y = y_at(open_value)
+        high_y = y_at(high_value)
+        low_y = y_at(low_value)
+        close_y = y_at(close_value)
+        draw.line((x, high_y, x, low_y), fill=color, width=1)
+        draw.rectangle((bar_left, min(open_y, close_y), bar_right, max(open_y, close_y)), fill=color)
     if close_points:
         draw.line(close_points, fill=line_color, width=2, joint="curve")
 
     sma_scale = 4
-    sma_masks = {period: Image.new("L", (width * sma_scale, height * sma_scale), 0) for period in SMA_PERIODS}
+    sma_margin = 4
+    sma_left = max(0, left - sma_margin)
+    sma_top = max(0, price_top - sma_margin)
+    sma_right = min(width, plot_right + sma_margin + 1)
+    sma_bottom = min(height, draw_bottom + sma_margin + 1)
+    sma_size = ((sma_right - sma_left) * sma_scale, (sma_bottom - sma_top) * sma_scale)
+    sma_masks = {period: Image.new("L", sma_size, 0) for period in SMA_PERIODS}
     sma_draws = {period: ImageDraw.Draw(mask) for period, mask in sma_masks.items()}
     for period, values in smas.items():
         points: list[tuple[float, float]] = []
@@ -1136,29 +1218,29 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
             value = values[i]
             if value is not None:
                 points.append((float(x_at(pos)), price_y_at(scaled(value))))
-        for start, end in zip(points, points[1:]):
+        for start, end in pairwise(points):
             clipped = clip_price_segment(start, end)
             if clipped is not None:
                 (x1, y1), (x2, y2) = clipped
                 sma_draws[period].line(
                     (
-                        round(x1 * sma_scale),
-                        round(y1 * sma_scale),
-                        round(x2 * sma_scale),
-                        round(y2 * sma_scale),
+                        round((x1 - sma_left) * sma_scale),
+                        round((y1 - sma_top) * sma_scale),
+                        round((x2 - sma_left) * sma_scale),
+                        round((y2 - sma_top) * sma_scale),
                     ),
                     fill=255,
                     width=max(1, round(1.25 * sma_scale)),
                 )
     for period, mask in sma_masks.items():
-        mask = mask.resize((width, height), Image.Resampling.LANCZOS)
-        image.paste(sma_colors[period], (0, 0, width, height), mask)
+        mask = mask.resize((sma_right - sma_left, sma_bottom - sma_top), Image.Resampling.LANCZOS)
+        image.paste(sma_colors[period], (sma_left, sma_top, sma_right, sma_bottom), mask)
 
     last_idx = indexes[-1]
     last = all_rows[last_idx]
-    prev = _safe_float(quote.get("prevClose")) or all_rows[max(0, last_idx - 1)][4]
-    change = (_safe_float(quote.get("perfDayUsd")) if quote.get("perfDayUsd") is not None else last[4] - prev) or 0.0
-    pct = (_safe_float(quote.get("perfDayPct")) if quote.get("perfDayPct") is not None else (change / prev * 100 if prev else 0.0)) or 0.0
+    prev = data.previous_close or all_rows[max(0, last_idx - 1)][4]
+    change = (data.change if data.change is not None else last[4] - prev) or 0.0
+    pct = (data.change_percent if data.change_percent is not None else (change / prev * 100 if prev else 0.0)) or 0.0
     change_color = up if change >= 0 else down
     candle_color = up if last[4] >= last[1] else down
     date = dt.datetime.fromtimestamp(last[0], dt.timezone.utc).strftime("%b %d")
@@ -1185,11 +1267,11 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
         if value is not None:
             draw.text((8, 46 + row * 22), f"SMA {period} · {_fmt(value)}", fill=sma_colors[period], font=sma_font)
     if period_shell:
-        side_font = font(14)
+        side_font = _font(14)
         label = request.timeframe_label.upper()
         label_img = Image.new("RGBA", (220, 42), (0, 0, 0, 0))
         label_draw = ImageDraw.Draw(label_img)
-        label_draw.text((0, 0), label, fill=text + (255,), font=side_font)
+        label_draw.text((0, 0), label, fill=(*text, 255), font=side_font)
         label_img = label_img.crop(label_img.getbbox() or (0, 0, 1, 1)).rotate(90, expand=True)
         image.paste(label_img, (18, price_top + (price_bottom - price_top - label_img.height) // 2), label_img)
 
@@ -1213,26 +1295,26 @@ def render_price_chart_png(quote: dict[str, Any], request: ChartRequest) -> byte
         draw.text((6, y - 9), _fmt_volume(value), fill=text, font=small_font)
 
     output = io.BytesIO()
-    image.save(output, format="PNG", optimize=True)
+    image.save(output, format="PNG")
     return output.getvalue()
 
 
 def _fmt(value: Any, suffix: str = "") -> str:
-    number = _safe_float(value)
+    number = safe_float(value)
     if number is None:
         return "n/a"
     return f"{number:,.2f}{suffix}" if abs(number) < 1000 else f"{number:,.0f}{suffix}"
 
 
 def _fmt_signed(value: Any, suffix: str = "") -> str:
-    number = _safe_float(value)
+    number = safe_float(value)
     if number is None:
         return "n/a"
     return ("+" if number > 0 else "") + _fmt(number, suffix)
 
 
 def _fmt_volume(value: Any) -> str:
-    number = _safe_float(value)
+    number = safe_float(value)
     if number is None:
         return "n/a"
     for suffix, scale in (("B", 1_000_000_000), ("M", 1_000_000), ("K", 1_000)):
@@ -1244,7 +1326,7 @@ def _fmt_volume(value: Any) -> str:
     return f"{number:,.0f}"
 
 
-def _header_volume_label(row: ChartRow, request: ChartRequest) -> str:
+def _header_volume_label(row: ChartRowValues, request: ChartRequest) -> str:
     if request.crypto_market:
         return _fmt_volume(row[5])
     if (
@@ -1256,52 +1338,51 @@ def _header_volume_label(row: ChartRow, request: ChartRequest) -> str:
     return _fmt_volume(row[5])
 
 
-def _quote_time_label(quote: dict[str, Any]) -> str | None:
-    timestamp = _safe_float(quote.get("lastTime"))
-    if timestamp is None:
-        dates = quote.get("date") or []
-        timestamp = _safe_float(dates[-1]) if dates else None
+def _quote_time_label(data: ChartData) -> str | None:
+    timestamp = data.last_time
+    if timestamp is None and data.rows:
+        timestamp = data.rows[-1].epoch
     if timestamp is None:
         return None
     stamp = dt.datetime.fromtimestamp(timestamp, dt.timezone.utc).astimezone(MARKET_TIME_ZONE)
     return stamp.strftime("%I:%M %p ET").lstrip("0")
 
 
-def _stock_previous_close(meta: dict[str, Any], closes: list[Any], request: ChartRequest) -> float | None:
-    valid_closes = [close for close in (_safe_float(value) for value in closes) if close is not None]
+def stock_previous_close(meta: dict[str, Any], closes: list[Any], request: ChartRequest) -> float | None:
+    valid_closes = [close for close in (safe_float(value) for value in closes) if close is not None]
     if request.timeframe == "d" and len(valid_closes) > 1:
-        latest_raw_close = _safe_float(closes[-1]) if closes else None
+        latest_raw_close = safe_float(closes[-1]) if closes else None
         if latest_raw_close is None:
-            previous = _safe_float(meta.get("previousClose"))
+            previous = safe_float(meta.get("previousClose"))
             if previous is not None:
                 return previous
-            chart_previous = _safe_float(meta.get("chartPreviousClose"))
+            chart_previous = safe_float(meta.get("chartPreviousClose"))
             if chart_previous is not None:
                 return chart_previous
             return valid_closes[-1]
         return valid_closes[-2]
-    previous = _safe_float(meta.get("previousClose"))
+    previous = safe_float(meta.get("previousClose"))
     if previous is not None:
         return previous
-    chart_previous = _safe_float(meta.get("chartPreviousClose"))
+    chart_previous = safe_float(meta.get("chartPreviousClose"))
     if chart_previous is not None:
         return chart_previous
     return valid_closes[-2] if len(valid_closes) > 1 else None
 
 
-def _latest_quote_price_time(
+def latest_quote_price_time(
     meta: dict[str, Any],
     dates: list[Any],
     closes: list[Any],
     request: ChartRequest,
 ) -> tuple[float | None, int | None]:
     latest_close = next(
-        (close for close in (_safe_float(value) for value in reversed(closes)) if close is not None),
+        (close for close in (safe_float(value) for value in reversed(closes)) if close is not None),
         None,
     )
     latest_time = int(dates[-1]) if dates else None
-    regular_price = _safe_float(meta.get("regularMarketPrice"))
-    regular_time_float = _safe_float(meta.get("regularMarketTime"))
+    regular_price = safe_float(meta.get("regularMarketPrice"))
+    regular_time_float = safe_float(meta.get("regularMarketTime"))
     regular_time = int(regular_time_float) if regular_time_float is not None else None
     if (
         not request.futures
@@ -1314,18 +1395,18 @@ def _latest_quote_price_time(
     return (regular_price if regular_price is not None else latest_close), (regular_time or latest_time)
 
 
-def _quote_display_name(quote: dict[str, Any]) -> str:
-    ticker = str(quote.get("ticker") or "").upper()
-    if quote.get("futures") and ticker in FUTURES_DISPLAY_NAMES:
+def _quote_display_name(data: ChartData) -> str:
+    ticker = data.ticker.upper()
+    if data.futures and ticker in FUTURES_DISPLAY_NAMES:
         return FUTURES_DISPLAY_NAMES[ticker]
-    return str(quote.get("name") or quote.get("ticker") or "quote")
+    return data.name or data.ticker or "quote"
 
 
-def quote_description(quote: dict[str, Any]) -> str:
-    metric_parts = [f"Last **{_fmt(quote.get('lastClose'))}**"]
-    if quote.get("perfDayUsd") is not None or quote.get("perfDayPct") is not None:
-        metric_parts.append(f"**{_fmt_signed(quote.get('perfDayUsd'))}** ({_fmt_signed(quote.get('perfDayPct'), '%')})")
-    time_label = _quote_time_label(quote)
+def quote_description(data: ChartData) -> str:
+    metric_parts = [f"Last **{_fmt(data.last_close)}**"]
+    if data.change is not None or data.change_percent is not None:
+        metric_parts.append(f"**{_fmt_signed(data.change)}** ({_fmt_signed(data.change_percent, '%')})")
+    time_label = _quote_time_label(data)
     if time_label:
         metric_parts.append(time_label)
-    return f"{_quote_display_name(quote)}\n" + " · ".join(metric_parts)
+    return f"{_quote_display_name(data)}\n" + " · ".join(metric_parts)
