@@ -765,7 +765,7 @@ def main() -> None:
         raise SystemExit("Missing DISCORD_TOKEN. Put it in .env or export it.")
     handler = logging.StreamHandler(sys.stdout)
     logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
-    client.run(token, log_handler=handler, log_level=logging.INFO)
+    client.run(token, log_handler=None)
 
 
 if __name__ == "__main__":
