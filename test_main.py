@@ -100,6 +100,27 @@ def tradingview_frame(payload: dict[str, Any]) -> str:
     encoded = json.dumps(payload, separators=(",", ":"))
     return f"~m~{len(encoded)}~m~{encoded}"
 
+def tradingview_chart_messages(
+    primary_rows: list[dict[str, Any]],
+    daily_rows: list[dict[str, Any]],
+) -> list[str]:
+    return [
+        tradingview_frame(
+            {
+                "m": "timescale_update",
+                "p": ["chart", {"s1": {"s": primary_rows}}],
+            }
+        )
+        + tradingview_frame({"m": "series_completed", "p": ["chart", "s1"]}),
+        tradingview_frame(
+            {
+                "m": "timescale_update",
+                "p": ["chart", {"d1": {"s": daily_rows}}],
+            }
+        )
+        + tradingview_frame({"m": "series_completed", "p": ["chart", "d1"]}),
+    ]
+
 
 def yahoo_payload(
     *,
@@ -175,14 +196,59 @@ async def test_non_retryable_statuses_fail_once_and_preserve_no_data() -> None:
     assert len(missing_fake.calls) == 1
 
 
-async def test_stock_uses_yahoo_previous_close_without_daily_fetch() -> None:
+async def test_index_alias_uses_yahoo_previous_close_without_daily_fetch() -> None:
     payload = yahoo_payload(closes=[100.0, 102.0, 104.0], previous_close=99.0)
     session, fake = session_for(lambda _url, _params: FakeResponse(200, payload))
-    data = await fetch_market_chart_data(session, ChartRequest("TEST", "i5", "5 min"))
+    data = await fetch_market_chart_data(session, ChartRequest("SPX", "i5", "5 min"))
     assert data.previous_close == 99.0
     assert data.change == 5.0
     assert data.source_interval_seconds == 300
     assert len(fake.calls) == 1
+
+async def test_stock_intraday_uses_tradingview_24h_session() -> None:
+    primary_rows = [
+        {"i": 2, "v": [1_787_634_000, 263.57, 263.57, 263.20, 263.25, 2964.0]},
+        {"i": 0, "v": [1_787_629_500, 263.45, 263.62, 263.43, 263.59, 1423.0]},
+        {"i": 1, "v": [1_787_630_400, 263.59, 263.59, 263.49, 263.52, 1038.0]},
+    ]
+    daily_rows = [
+        {"i": 0, "v": [1_787_414_400, 260.0, 264.0, 259.0, 260.11, 1000.0]},
+        {"i": 1, "v": [1_787_500_800, 261.0, 263.0, 260.0, 258.63, 1200.0]},
+        {"i": 2, "v": [1_787_587_200, 262.0, 264.0, 261.0, 262.07, 200.0]},
+    ]
+    messages = tradingview_chart_messages(primary_rows, daily_rows)
+    messages[0] = tradingview_frame(
+        {
+            "m": "symbol_resolved",
+            "p": ["chart", "symbol_1", {"description": "Amazon.com, Inc."}],
+        }
+    ) + messages[0]
+
+    def unexpected_http(url: str, _params: dict[str, Any] | None) -> FakeResponse:
+        raise AssertionError(f"Unexpected HTTP request: {url}")
+
+    session, fake = session_for(unexpected_http, messages)
+    data = await fetch_market_chart_data(
+        session,
+        ChartRequest("AMZN", "i15", "15 min"),
+    )
+
+    assert [row.epoch for row in data.rows] == [
+        1_787_629_500,
+        1_787_630_400,
+        1_787_634_000,
+    ]
+    assert data.name == "Amazon.com, Inc."
+    assert data.last_close == 263.25
+    assert data.previous_close == 262.07
+    assert data.market_label == "TradingView 24h"
+    assert not data.futures
+    assert data.source_interval_seconds == 900
+    assert not fake.calls
+    sent = "".join(fake.websocket.sent)
+    assert "AMZN" in sent
+    assert "24h" in sent
+    assert "symbol_daily" in sent
 
 
 async def test_futures_uses_tradingview_full_session_and_daily_reference() -> None:
@@ -196,22 +262,7 @@ async def test_futures_uses_tradingview_full_session_and_daily_reference() -> No
         {"i": 1, "v": [1_779_786_400, 95.0, 99.0, 94.0, 98.0, 1200.0]},
         {"i": 2, "v": [1_779_872_800, 98.0, 104.0, 97.0, 103.0, 200.0]},
     ]
-    messages = [
-        tradingview_frame(
-            {
-                "m": "timescale_update",
-                "p": ["chart", {"s1": {"s": intraday_rows}}],
-            }
-        )
-        + tradingview_frame({"m": "series_completed", "p": ["chart", "s1"]}),
-        tradingview_frame(
-            {
-                "m": "timescale_update",
-                "p": ["chart", {"d1": {"s": daily_rows}}],
-            }
-        )
-        + tradingview_frame({"m": "series_completed", "p": ["chart", "d1"]}),
-    ]
+    messages = tradingview_chart_messages(intraday_rows, daily_rows)
 
     def unexpected_http(url: str, _params: dict[str, Any] | None) -> FakeResponse:
         raise AssertionError(f"Unexpected HTTP request: {url}")
@@ -331,7 +382,8 @@ async def test_binance_five_year_history_paginates_through_cutoff() -> None:
 async def run_tests() -> None:
     await test_retry_once()
     await test_non_retryable_statuses_fail_once_and_preserve_no_data()
-    await test_stock_uses_yahoo_previous_close_without_daily_fetch()
+    await test_index_alias_uses_yahoo_previous_close_without_daily_fetch()
+    await test_stock_intraday_uses_tradingview_24h_session()
     await test_futures_uses_tradingview_full_session_and_daily_reference()
     await test_okx_is_primary_for_perp_and_uses_rolling_24h_change()
     await test_ticker_failure_does_not_fake_candle_change()

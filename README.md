@@ -51,7 +51,8 @@ Options can be in any order after the ticker.
 | Themes | `light`, `dark` |
 | Scales | `linear`, `log`, `percent` |
 
-Bare stock and crypto commands default to the latest 5-minute chart. Crypto intraday charts use
+Bare stock and crypto commands default to the latest 5-minute chart. U.S. stock
+intraday charts use TradingView 24-hour candles, including overnight trading. Crypto intraday charts use
 perpetual data; crypto daily/weekly/monthly and range charts use Binance spot OHLCV history.
 Crypto embeds show rolling 24-hour price changes consistently across timeframes. Use `;BTC max`
 for full available Binance spot history with volume.

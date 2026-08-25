@@ -310,6 +310,8 @@ def test_charting_regressions() -> None:
     assert _stock_extended_session_key(et_epoch(7, 10)) == ("pre", dt.date(2026, 6, 15))
     assert _stock_extended_session_key(et_epoch(10, 10)) is None
     assert _stock_extended_session_key(et_epoch(16, 0)) == ("after", dt.date(2026, 6, 15))
+    assert _stock_extended_session_key(et_epoch(20, 0)) == ("overnight", dt.date(2026, 6, 16))
+    assert _stock_extended_session_key(et_epoch(1, 0, 16)) == ("overnight", dt.date(2026, 6, 16))
     session_rows = [
         (et_epoch(4, 0), 1.0, 1.0, 1.0, 1.0, 1.0),
         (et_epoch(9, 30), 1.0, 1.0, 1.0, 1.0, 1.0),
@@ -318,7 +320,8 @@ def test_charting_regressions() -> None:
     ]
     assert _stock_extended_session_bands(session_rows, [10, 20, 30, 40], 10, 40) == [
         (10, 15, "pre"),
-        (25, 40, "after"),
+        (25, 35, "after"),
+        (35, 40, "overnight"),
     ]
     assert _futures_globex_session_key(et_epoch(7, 10)) == ("globex", "globex")
     assert _futures_globex_session_key(et_epoch(10, 10)) is None

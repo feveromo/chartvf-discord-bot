@@ -638,9 +638,16 @@ def _stock_5m_today_indexes(rows: Sequence[ChartRowValues], request: ChartReques
     if request.futures or request.timeframe != "i5" or request.date_range:
         return None
     last_local = dt.datetime.fromtimestamp(rows[-1][0], dt.timezone.utc).astimezone(MARKET_TIME_ZONE)
-    start = dt.datetime.combine(last_local.date(), STOCK_5M_START, MARKET_TIME_ZONE).timestamp()
-    end = dt.datetime.combine(last_local.date(), STOCK_5M_END, MARKET_TIME_ZONE).timestamp()
-    indexes = [i for i, row in enumerate(rows) if start <= row[0] <= end]
+    session_date = last_local.date()
+    if last_local.time() >= STOCK_5M_END:
+        session_date += dt.timedelta(days=1)
+    start = dt.datetime.combine(
+        session_date - dt.timedelta(days=1),
+        STOCK_5M_END,
+        MARKET_TIME_ZONE,
+    ).timestamp()
+    end = dt.datetime.combine(session_date, STOCK_5M_END, MARKET_TIME_ZONE).timestamp()
+    indexes = [i for i, row in enumerate(rows) if start <= row[0] < end]
     if len(indexes) >= SPARSE_CHART_MIN_BARS:
         return indexes
     same_day = [
@@ -683,9 +690,13 @@ def _is_regular_stock_session(epoch: int) -> bool:
 def _stock_extended_session_key(epoch: int) -> SessionKey | None:
     local = dt.datetime.fromtimestamp(epoch, dt.timezone.utc).astimezone(MARKET_TIME_ZONE)
     local_time = local.time()
+    if local_time >= STOCK_5M_END:
+        return "overnight", local.date() + dt.timedelta(days=1)
+    if local_time < STOCK_5M_START:
+        return "overnight", local.date()
     if STOCK_5M_START <= local_time < REGULAR_SESSION_START:
         return "pre", local.date()
-    if REGULAR_SESSION_END <= local_time <= STOCK_5M_END:
+    if REGULAR_SESSION_END <= local_time < STOCK_5M_END:
         return "after", local.date()
     return None
 
@@ -1045,11 +1056,12 @@ def render_price_chart_png(data: ChartData, request: ChartRequest) -> bytes:
     session_fills = {
         "pre": (34, 42, 58) if dark else (236, 244, 252),
         "after": (45, 39, 53) if dark else (250, 240, 247),
+        "overnight": (43, 40, 58) if dark else (244, 240, 250),
         "globex": (34, 42, 58) if dark else (236, 244, 252),
     }
     session_boundary = (61, 76, 101) if dark else (184, 195, 211)
     session_text = (108, 126, 158) if dark else (112, 124, 143)
-    session_labels = {"pre": "PRE", "after": "AH", "globex": "GLOBEX"}
+    session_labels = {"pre": "PRE", "after": "AH", "overnight": "ON", "globex": "GLOBEX"}
 
     def x_at(i: int) -> int:
         return x_positions[i]
