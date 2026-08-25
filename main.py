@@ -39,6 +39,19 @@ import aiohttp
 import discord
 from dotenv import load_dotenv
 
+from webull import (
+    STOCK_INTERVAL_SECONDS as WEBULL_STOCK_INTERVAL_SECONDS,
+    LiveQuote,
+    WebullProviderError,
+    WebullStreamer,
+    bucket_rows,
+    fetch_intraday_bars,
+    fetch_realtime_quote,
+    patch_live_bar,
+    resolve_ticker,
+    snapshot_quote,
+)
+
 
 class MarketDataProviderError(RuntimeError):
     pass
@@ -83,7 +96,8 @@ Options can be in any order after the ticker.
 **Futures** (`;fut`/`;future`/`;futures`): `;f` is still Ford (`F`).
 
 **Freshness**: bare stock, futures, and crypto commands default to the latest 5-minute chart.
-Stock intraday charts use TradingView 24-hour candles, including overnight trading.
+Stock intraday charts use real-time Webull candles (tick-level push, pre/post market included),
+with TradingView 24-hour candles as fallback.
 Supported futures intraday charts use delayed TradingView continuous-contract candles.
 Crypto intraday charts use perp data; crypto daily/weekly/monthly and range charts use Binance spot
 OHLCV history. Crypto change figures are rolling 24-hour values. `;BTC max` fetches all available
@@ -181,6 +195,7 @@ RENDER_SEMAPHORE = asyncio.Semaphore(1)
 
 class ChartBot(discord.Client):
     session: aiohttp.ClientSession | None = None
+    webull_streamer: WebullStreamer | None = None
 
     async def setup_hook(self) -> None:
         connector = aiohttp.TCPConnector(
@@ -198,8 +213,13 @@ class ChartBot(discord.Client):
                 "Accept": "application/json",
             },
         )
+        self.webull_streamer = WebullStreamer()
+        self.webull_streamer.start()
 
     async def close(self) -> None:
+        if self.webull_streamer is not None:
+            self.webull_streamer.stop()
+            self.webull_streamer = None
         if self.session is not None:
             await self.session.close()
             self.session = None
@@ -1001,11 +1021,113 @@ async def fetch_tradingview_intraday_chart_data(
     )
 
 
+async def fetch_webull_intraday_chart_data(
+    session: aiohttp.ClientSession, request: ChartRequest
+) -> ChartData:
+    """Real-time stock intraday charts from Webull's anonymous gateways.
+
+    Native interval klines (extended hours included), with 2m/3m aggregated
+    from 1m, and the forming bar patched from the MQTT tick stream when live
+    or from the real-time REST snapshot.
+    """
+    bucket_seconds = WEBULL_STOCK_INTERVAL_SECONDS[request.timeframe]
+    resolution = await resolve_ticker(session, request.ticker)
+    if resolution is None and "-" in request.ticker:
+        resolution = await resolve_ticker(session, request.ticker.replace("-", "."))
+    if resolution is None:
+        raise NoChartData(f"No chart data found for `{request.ticker}`.")
+
+    streamer = client.webull_streamer
+    if streamer is not None:
+        # Subscribe before the REST work so the first request can use a push
+        # received while history and snapshot calls are in flight.
+        streamer.subscribe(resolution.ticker_id)
+
+    bars_task = asyncio.create_task(
+        fetch_intraday_bars(session, resolution.ticker_id, request.timeframe)
+    )
+    quote_task = asyncio.create_task(fetch_realtime_quote(session, resolution.ticker_id))
+    try:
+        history_rows, history_pre_close = await bars_task
+    except BaseException:
+        quote_task.cancel()
+        await asyncio.gather(quote_task, return_exceptions=True)
+        raise
+    last: float | None = None
+    previous: float | None = None
+    last_time: int | None = None
+    session_flag = ""
+    try:
+        raw_quote = await quote_task
+        last, previous, last_time, session_flag = snapshot_quote(raw_quote)
+    except WebullProviderError:
+        pass
+    if previous is None:
+        previous = history_pre_close
+    live: LiveQuote | None = streamer.latest(resolution.ticker_id) if streamer else None
+    if live is not None and (last_time is None or live.pub_ms // 1000 >= last_time):
+        last = live.price
+        last_time = int(live.pub_ms // 1000)
+        session_flag = live.session or session_flag
+
+    rows = (
+        bucket_rows(history_rows, bucket_seconds)
+        if request.timeframe in {"i2", "i3"}
+        else list(history_rows)
+    )
+    if last is not None:
+        rows = patch_live_bar(
+            rows,
+            LiveQuote(last, (last_time or int(time.time())) * 1000, session_flag),
+            bucket_seconds,
+        )
+    if len(rows) < 2:
+        raise NoChartData(f"Too little chart data found for `{request.ticker}`.")
+
+    last_close = last if last is not None else rows[-1][4]
+    last_time = last_time if last_time is not None else rows[-1][0]
+    change = (last_close - previous) if previous else None
+    return ChartData(
+        ticker=request.ticker,
+        name=resolution.name,
+        rows=tuple(ChartRow(*row) for row in rows),
+        last_close=last_close,
+        last_time=last_time,
+        previous_close=previous,
+        change=change,
+        change_percent=(change / previous * 100)
+        if change is not None and previous
+        else None,
+        market_label="Webull real-time",
+        source_interval_seconds=bucket_seconds,
+        preserve_last_bar=True,
+    )
+
+
 async def fetch_market_chart_data(
     session: aiohttp.ClientSession, request: ChartRequest
 ) -> ChartData:
     if request.crypto_market:
         return await fetch_crypto_chart_data(session, request)
+    if (
+        not request.futures
+        and request.timeframe in WEBULL_STOCK_INTERVAL_SECONDS
+        and request.ticker not in YAHOO_SYMBOL_ALIASES
+    ):
+        try:
+            return await fetch_webull_intraday_chart_data(session, request)
+        except (
+            aiohttp.ClientError,
+            TimeoutError,
+            JSONDecodeError,
+            NoChartData,
+            WebullProviderError,
+        ) as error:
+            LOGGER.info(
+                "provider_fallback source=webull target=tradingview ticker=%s error_type=%s",
+                request.ticker,
+                type(error).__name__,
+            )
     if (
         request.timeframe in TRADINGVIEW_INTERVALS
         and (

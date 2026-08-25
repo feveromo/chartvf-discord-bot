@@ -17,7 +17,8 @@ jobs:
       - run: python test_charting.py
       - run: python test_main.py
       - run: python test_rendering.py
-      - run: python -m py_compile main.py charting.py test_charting.py test_main.py test_rendering.py
-      - run: pyright --pythonpath "$(command -v python)" main.py charting.py test_charting.py test_main.py test_rendering.py
-      - run: ruff check main.py charting.py test_charting.py test_main.py test_rendering.py
+      - run: python test_webull.py
+      - run: python -m py_compile main.py charting.py webull.py test_charting.py test_main.py test_rendering.py test_webull.py
+      - run: pyright --pythonpath "$(command -v python)" main.py charting.py webull.py test_charting.py test_main.py test_rendering.py test_webull.py
+      - run: ruff check main.py charting.py webull.py test_charting.py test_main.py test_rendering.py test_webull.py
       - run: pip check

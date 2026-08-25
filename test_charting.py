@@ -81,6 +81,7 @@ def _chart_data(raw: dict[str, Any]) -> ChartData:
         change_percent=safe_float(raw.get("perfDayPct")),
         market_label=str(raw.get("marketLabel") or ""),
         futures=bool(raw.get("futures")),
+        preserve_last_bar=bool(raw.get("preserveLastBar")),
     )
 
 
@@ -341,6 +342,10 @@ def test_charting_regressions() -> None:
     assert _source_interval_seconds(ChartRequest("ES", "i10", "10 min", futures=True)) == 5 * 60
     assert _source_interval_seconds(ChartRequest("ES", "h2", "2 hour", futures=True)) == 60 * 60
     assert len(_quote_rows(live_quote_rows, ChartRequest("AMD", "i5", "5 min"))) == 1
+    assert len(_quote_rows(
+        dict(live_quote_rows, preserveLastBar=True),
+        ChartRequest("AMD", "i5", "5 min"),
+    )) == 2
     assert len(_quote_rows(live_quote_rows, ChartRequest("ES", "i5", "5 min", futures=True))) == 1
     assert len(_quote_rows({
         "date": [et_epoch(10, 0), et_epoch(10, 5)],
