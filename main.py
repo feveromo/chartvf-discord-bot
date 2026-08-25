@@ -12,7 +12,11 @@ from typing import Any
 
 from charting import (
     BINANCE_CRYPTO_SYMBOLS,
+    MARKET_TIME_ZONE,
     PREFIX,
+    REGULAR_SESSION_END,
+    REGULAR_SESSION_START,
+    YAHOO_SYMBOL_ALIASES,
     ChartData,
     ChartRequest,
     ChartRow,
@@ -79,6 +83,7 @@ Options can be in any order after the ticker.
 **Futures** (`;fut`/`;future`/`;futures`): `;f` is still Ford (`F`).
 
 **Freshness**: bare stock, futures, and crypto commands default to the latest 5-minute chart.
+Stock intraday charts use TradingView 24-hour candles, including overnight trading.
 Supported futures intraday charts use delayed TradingView continuous-contract candles.
 Crypto intraday charts use perp data; crypto daily/weekly/monthly and range charts use Binance spot
 OHLCV history. Crypto change figures are rolling 24-hour values. `;BTC max` fetches all available
@@ -775,16 +780,20 @@ def _tradingview_message(method: str, params: list[Any]) -> str:
     return f"~m~{len(payload)}~m~{payload}"
 
 
-async def fetch_tradingview_futures_chart_data(
+async def fetch_tradingview_intraday_chart_data(
     session: aiohttp.ClientSession,
     request: ChartRequest,
 ) -> ChartData:
-    symbol = TRADINGVIEW_FUTURES_SYMBOLS.get(request.ticker)
+    symbol = (
+        TRADINGVIEW_FUTURES_SYMBOLS.get(request.ticker)
+        if request.futures
+        else request.ticker.replace("-", ".")
+    )
     interval = TRADINGVIEW_INTERVALS.get(request.timeframe)
     interval_seconds = TRADINGVIEW_INTERVAL_SECONDS.get(request.timeframe)
     if symbol is None or interval is None or interval_seconds is None:
         raise NoChartData(
-            f"No accurate intraday futures data found for `{request.ticker}`."
+            f"No accurate intraday data found for `{request.ticker}`."
         )
 
     chart_session = f"cs_{secrets.token_hex(6)}"
@@ -792,7 +801,12 @@ async def fetch_tradingview_futures_chart_data(
     expected_series = set(series_rows)
     completed_series: set[str] = set()
     daily_series_requested = False
+    resolved_name = request.ticker
     symbol_spec = "=" + json.dumps(
+        {"symbol": symbol, "adjustment": "splits", "session": "regular" if request.futures else "24h"},
+        separators=(",", ":"),
+    )
+    daily_symbol_spec = "=" + json.dumps(
         {"symbol": symbol, "adjustment": "splits", "session": "regular"},
         separators=(",", ":"),
     )
@@ -844,6 +858,16 @@ async def fetch_tradingview_futures_chart_data(
                             continue
                         method = payload.get("m")
                         params = payload.get("p") or []
+                        if (
+                            method == "symbol_resolved"
+                            and len(params) > 2
+                            and isinstance(params[2], dict)
+                        ):
+                            resolved_name = str(
+                                params[2].get("description")
+                                or params[2].get("short_description")
+                                or request.ticker
+                            )
                         if method == "symbol_error":
                             raise NoChartData(
                                 f"No chart data found for `{request.ticker}`."
@@ -901,6 +925,15 @@ async def fetch_tradingview_futures_chart_data(
                                         [chart_session, "s1"],
                                     )
                                 )
+                                daily_symbol = "symbol_1"
+                                if not request.futures:
+                                    daily_symbol = "symbol_daily"
+                                    await websocket.send_str(
+                                        _tradingview_message(
+                                            "resolve_symbol",
+                                            [chart_session, daily_symbol, daily_symbol_spec],
+                                        )
+                                    )
                                 await websocket.send_str(
                                     _tradingview_message(
                                         "create_series",
@@ -908,7 +941,7 @@ async def fetch_tradingview_futures_chart_data(
                                             chart_session,
                                             "d1",
                                             "d1",
-                                            "symbol_1",
+                                            daily_symbol,
                                             "1D",
                                             3,
                                             "",
@@ -937,11 +970,23 @@ async def fetch_tradingview_futures_chart_data(
         raise NoChartData(f"Too little chart data found for `{request.ticker}`.")
 
     last = rows[-1].close
-    previous = daily_rows[-2].close if len(daily_rows) > 1 else None
+    if request.futures:
+        previous = daily_rows[-2].close if len(daily_rows) > 1 else None
+    else:
+        last_local_time = dt.datetime.fromtimestamp(
+            rows[-1].epoch,
+            dt.timezone.utc,
+        ).astimezone(MARKET_TIME_ZONE).time()
+        during_regular_session = REGULAR_SESSION_START <= last_local_time < REGULAR_SESSION_END
+        previous = (
+            daily_rows[-2].close
+            if during_regular_session and len(daily_rows) > 1
+            else daily_rows[-1].close if daily_rows else None
+        )
     change = last - previous if previous is not None else None
     return ChartData(
         ticker=request.ticker,
-        name=request.ticker,
+        name=resolved_name,
         rows=rows,
         last_close=last,
         last_time=rows[-1].epoch,
@@ -950,8 +995,8 @@ async def fetch_tradingview_futures_chart_data(
         change_percent=(change / previous * 100)
         if change is not None and previous
         else None,
-        market_label="TradingView delayed",
-        futures=True,
+        market_label="TradingView delayed" if request.futures else "TradingView 24h",
+        futures=request.futures,
         source_interval_seconds=interval_seconds,
     )
 
@@ -962,11 +1007,13 @@ async def fetch_market_chart_data(
     if request.crypto_market:
         return await fetch_crypto_chart_data(session, request)
     if (
-        request.futures
-        and request.ticker in TRADINGVIEW_FUTURES_SYMBOLS
-        and request.timeframe in TRADINGVIEW_INTERVALS
+        request.timeframe in TRADINGVIEW_INTERVALS
+        and (
+            (request.futures and request.ticker in TRADINGVIEW_FUTURES_SYMBOLS)
+            or (not request.futures and request.ticker not in YAHOO_SYMBOL_ALIASES)
+        )
     ):
-        return await fetch_tradingview_futures_chart_data(session, request)
+        return await fetch_tradingview_intraday_chart_data(session, request)
 
     daily_reference_task = (
         asyncio.create_task(fetch_daily_previous_close(session, request))
