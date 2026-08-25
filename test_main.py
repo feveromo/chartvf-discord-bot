@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from collections.abc import Callable
 from typing import Any, cast
@@ -16,7 +17,9 @@ from main import (
 
 
 class FakeResponse:
-    def __init__(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
+    def __init__(
+        self, status: int, payload: Any, headers: dict[str, str] | None = None
+    ) -> None:
         self.status = status
         self.payload = payload
         self.headers = headers or {}
@@ -34,23 +37,68 @@ class FakeResponse:
         return self.payload
 
 
+class FakeWebSocketMessage:
+    type = aiohttp.WSMsgType.TEXT
+
+    def __init__(self, data: str) -> None:
+        self.data = data
+
+
+class FakeWebSocket:
+    def __init__(self, messages: list[str]) -> None:
+        self.messages = [FakeWebSocketMessage(message) for message in messages]
+        self.sent: list[str] = []
+
+    async def __aenter__(self) -> "FakeWebSocket":
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    def __aiter__(self) -> "FakeWebSocket":
+        return self
+
+    async def __anext__(self) -> FakeWebSocketMessage:
+        if not self.messages:
+            raise StopAsyncIteration
+        return self.messages.pop(0)
+
+    async def send_str(self, message: str) -> None:
+        self.sent.append(message)
+
+
 Router = Callable[[str, dict[str, Any] | None], FakeResponse]
 
 
 class FakeSession:
-    def __init__(self, router: Router) -> None:
+    def __init__(
+        self, router: Router, websocket_messages: list[str] | None = None
+    ) -> None:
         self.router = router
         self.calls: list[tuple[str, dict[str, Any] | None]] = []
+        self.websocket = FakeWebSocket(websocket_messages or [])
 
     def get(self, url: str, *, params: dict[str, Any] | None = None) -> FakeResponse:
         copied_params = dict(params) if params is not None else None
         self.calls.append((url, copied_params))
         return self.router(url, copied_params)
 
+    def ws_connect(self, _url: str, *, origin: str, heartbeat: int) -> FakeWebSocket:
+        del origin, heartbeat
+        return self.websocket
 
-def session_for(router: Router) -> tuple[aiohttp.ClientSession, FakeSession]:
-    fake = FakeSession(router)
+
+def session_for(
+    router: Router,
+    websocket_messages: list[str] | None = None,
+) -> tuple[aiohttp.ClientSession, FakeSession]:
+    fake = FakeSession(router, websocket_messages)
     return cast(aiohttp.ClientSession, fake), fake
+
+
+def tradingview_frame(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, separators=(",", ":"))
+    return f"~m~{len(encoded)}~m~{encoded}"
 
 
 def yahoo_payload(
@@ -65,23 +113,29 @@ def yahoo_payload(
     timestamps = [start + index * step for index in range(len(closes))]
     return {
         "chart": {
-            "result": [{
-                "meta": {
-                    "shortName": name,
-                    "previousClose": previous_close,
-                    "regularMarketPrice": closes[-1],
-                    "regularMarketTime": timestamps[-1],
-                    "dataGranularity": interval,
-                },
-                "timestamp": timestamps,
-                "indicators": {"quote": [{
-                    "open": [close - 0.5 for close in closes],
-                    "high": [close + 1 for close in closes],
-                    "low": [close - 1 for close in closes],
-                    "close": closes,
-                    "volume": [1000 for _ in closes],
-                }]},
-            }],
+            "result": [
+                {
+                    "meta": {
+                        "shortName": name,
+                        "previousClose": previous_close,
+                        "regularMarketPrice": closes[-1],
+                        "regularMarketTime": timestamps[-1],
+                        "dataGranularity": interval,
+                    },
+                    "timestamp": timestamps,
+                    "indicators": {
+                        "quote": [
+                            {
+                                "open": [close - 0.5 for close in closes],
+                                "high": [close + 1 for close in closes],
+                                "low": [close - 1 for close in closes],
+                                "close": closes,
+                                "volume": [1000 for _ in closes],
+                            }
+                        ]
+                    },
+                }
+            ],
             "error": None,
         },
     }
@@ -107,9 +161,13 @@ async def test_non_retryable_statuses_fail_once_and_preserve_no_data() -> None:
         raise AssertionError("HTTP 451 should fail without retrying")
     assert len(fake.calls) == 1
 
-    missing_session, missing_fake = session_for(lambda _url, _params: FakeResponse(404, {}))
+    missing_session, missing_fake = session_for(
+        lambda _url, _params: FakeResponse(404, {})
+    )
     try:
-        await fetch_market_chart_data(missing_session, ChartRequest("MISSING", "d", "daily"))
+        await fetch_market_chart_data(
+            missing_session, ChartRequest("MISSING", "d", "daily")
+        )
     except NoChartData:
         pass
     else:
@@ -127,19 +185,55 @@ async def test_stock_uses_yahoo_previous_close_without_daily_fetch() -> None:
     assert len(fake.calls) == 1
 
 
-async def test_futures_fetches_daily_reference_concurrently() -> None:
-    intraday = yahoo_payload(closes=[6100.0, 6110.0], previous_close=6000.0)
-    daily = yahoo_payload(closes=[5980.0, 6050.0, 6110.0], previous_close=5980.0, interval="1d")
+async def test_futures_uses_tradingview_full_session_and_daily_reference() -> None:
+    intraday_rows = [
+        {"i": 2, "v": [1_780_001_800, 102.0, 104.0, 101.0, 103.0, 12.0]},
+        {"i": 0, "v": [1_780_000_000, 98.0, 101.0, 97.0, 100.0, 8.0]},
+        {"i": 1, "v": [1_780_000_900, 100.0, 103.0, 99.0, 102.0, 10.0]},
+    ]
+    daily_rows = [
+        {"i": 0, "v": [1_779_700_000, 94.0, 97.0, 93.0, 95.0, 1000.0]},
+        {"i": 1, "v": [1_779_786_400, 95.0, 99.0, 94.0, 98.0, 1200.0]},
+        {"i": 2, "v": [1_779_872_800, 98.0, 104.0, 97.0, 103.0, 200.0]},
+    ]
+    messages = [
+        tradingview_frame(
+            {
+                "m": "timescale_update",
+                "p": ["chart", {"s1": {"s": intraday_rows}}],
+            }
+        )
+        + tradingview_frame({"m": "series_completed", "p": ["chart", "s1"]}),
+        tradingview_frame(
+            {
+                "m": "timescale_update",
+                "p": ["chart", {"d1": {"s": daily_rows}}],
+            }
+        )
+        + tradingview_frame({"m": "series_completed", "p": ["chart", "d1"]}),
+    ]
 
-    def route(url: str, _params: dict[str, Any] | None) -> FakeResponse:
-        return FakeResponse(200, daily if "interval=1d" in url else intraday)
+    def unexpected_http(url: str, _params: dict[str, Any] | None) -> FakeResponse:
+        raise AssertionError(f"Unexpected HTTP request: {url}")
 
-    session, fake = session_for(route)
-    request = ChartRequest("ES", "i5", "5 min", futures=True)
+    session, fake = session_for(unexpected_http, messages)
+    request = ChartRequest("ES", "i15", "15 min", futures=True)
     data = await fetch_market_chart_data(session, request)
-    assert data.previous_close == 6050.0
-    assert data.change == 60.0
-    assert len(fake.calls) == 2
+
+    assert [row.epoch for row in data.rows] == [
+        1_780_000_000,
+        1_780_000_900,
+        1_780_001_800,
+    ]
+    assert [row.close for row in data.rows] == [100.0, 102.0, 103.0]
+    assert data.previous_close == 98.0
+    assert data.last_close == 103.0
+    assert data.change == 5.0
+    assert data.source_interval_seconds == 900
+    assert data.market_label == "TradingView delayed"
+    assert not fake.calls
+    assert any("CME_MINI:ES1!" in message for message in fake.websocket.sent)
+    assert any('"remove_series"' in message for message in fake.websocket.sent)
 
 
 async def test_okx_is_primary_for_perp_and_uses_rolling_24h_change() -> None:
@@ -153,7 +247,13 @@ async def test_okx_is_primary_for_perp_and_uses_rolling_24h_change() -> None:
         if url.endswith("/history-candles"):
             return FakeResponse(200, {"code": "0", "data": rows})
         if url.endswith("/ticker"):
-            return FakeResponse(200, {"code": "0", "data": [{"last": "105", "open24h": "95", "ts": "1780000900000"}]})
+            return FakeResponse(
+                200,
+                {
+                    "code": "0",
+                    "data": [{"last": "105", "open24h": "95", "ts": "1780000900000"}],
+                },
+            )
         raise AssertionError(f"Unexpected provider URL: {url}")
 
     session, fake = session_for(route)
@@ -198,7 +298,15 @@ async def test_binance_five_year_history_paginates_through_cutoff() -> None:
         limit = int(params["limit"])
         count = min(limit, max(0, (now_ms - start) // day_ms + 1))
         rows = [
-            [start + index * day_ms, "100", "102", "99", "101", "10", start + (index + 1) * day_ms - 1]
+            [
+                start + index * day_ms,
+                "100",
+                "102",
+                "99",
+                "101",
+                "10",
+                start + (index + 1) * day_ms - 1,
+            ]
             for index in range(count)
         ]
         return FakeResponse(200, rows)
@@ -224,7 +332,7 @@ async def run_tests() -> None:
     await test_retry_once()
     await test_non_retryable_statuses_fail_once_and_preserve_no_data()
     await test_stock_uses_yahoo_previous_close_without_daily_fetch()
-    await test_futures_fetches_daily_reference_concurrently()
+    await test_futures_uses_tradingview_full_session_and_daily_reference()
     await test_okx_is_primary_for_perp_and_uses_rolling_24h_change()
     await test_ticker_failure_does_not_fake_candle_change()
     await test_binance_five_year_history_paginates_through_cutoff()
