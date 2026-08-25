@@ -58,10 +58,10 @@ for full available Binance spot history with volume.
 
 ## Futures
 
-Futures use `;fut`/`;future`/`;futures`; `;f` remains Ford (`F`). Futures roots
-are mapped to market symbols such as `ES=F`, `NQ=F`, `GC=F`, `CL=F`, and `6E=F`
-for chart data, then rendered locally by the bot.
-
+Futures use `;fut`/`;future`/`;futures`; `;f` remains Ford (`F`). Intraday charts for
+`ES`, `MES`, `NQ`, `MNQ`, `YM`, `MYM`, `RTY`, `M2K`, `CL`, `GC`, and `6E` use
+TradingView continuous-contract candles. CME/CBOT/NYMEX/COMEX data is delayed by the
+provider. Daily, weekly, monthly, and unmapped futures roots continue to use Yahoo data.
 ## Setup
 
 ```bash
