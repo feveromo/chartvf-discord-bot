@@ -270,6 +270,7 @@ class ChartData:
     market_label: str = ""
     futures: bool = False
     source_interval_seconds: int | None = None
+    preserve_last_bar: bool = False
 
 
 class NoChartData(ValueError):
@@ -480,7 +481,10 @@ def _drop_live_quote_row(
     rows: list[ChartRow],
     request: ChartRequest,
     source_interval_seconds: int | None = None,
+    preserve_last_bar: bool = False,
 ) -> list[ChartRow]:
+    if preserve_last_bar:
+        return rows
     interval = source_interval_seconds or _source_interval_seconds(request)
     if interval is None or len(rows) < 2:
         return rows
@@ -599,7 +603,12 @@ def normalize_chart_rows(
 
 
 def _chart_rows(data: ChartData, request: ChartRequest) -> list[ChartRow]:
-    rows = _drop_live_quote_row(list(data.rows), request, data.source_interval_seconds)
+    rows = _drop_live_quote_row(
+        list(data.rows),
+        request,
+        data.source_interval_seconds,
+        data.preserve_last_bar,
+    )
     if request.timeframe == "m":
         rows = _collapse_monthly_rows(rows)
     if not rows:

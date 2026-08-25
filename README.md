@@ -52,7 +52,8 @@ Options can be in any order after the ticker.
 | Scales | `linear`, `log`, `percent` |
 
 Bare stock and crypto commands default to the latest 5-minute chart. U.S. stock
-intraday charts use TradingView 24-hour candles, including overnight trading. Crypto intraday charts use
+intraday charts use real-time Webull candles (anonymous tick-level stream plus native interval history,
+pre/post market included), with TradingView 24-hour candles as fallback. Crypto intraday charts use
 perpetual data; crypto daily/weekly/monthly and range charts use Binance spot OHLCV history.
 Crypto embeds show rolling 24-hour price changes consistently across timeframes. Use `;BTC max`
 for full available Binance spot history with volume.
@@ -93,8 +94,9 @@ pip install -r requirements.txt -r requirements-dev.txt
 python test_charting.py
 python test_main.py
 python test_rendering.py
-python -m py_compile main.py charting.py test_charting.py test_main.py test_rendering.py
-pyright --pythonpath .venv/bin/python main.py charting.py test_charting.py test_main.py test_rendering.py
-ruff check main.py charting.py test_charting.py test_main.py test_rendering.py
+python test_webull.py
+python -m py_compile main.py charting.py webull.py test_charting.py test_main.py test_rendering.py test_webull.py
+pyright --pythonpath .venv/bin/python main.py charting.py webull.py test_charting.py test_main.py test_rendering.py test_webull.py
+ruff check main.py charting.py webull.py test_charting.py test_main.py test_rendering.py test_webull.py
 pip check
 ```
