@@ -93,8 +93,8 @@ class ChartBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self.session = create_session()
+        # Connects on the first stock intraday chart, not at startup.
         self.webull_streamer = WebullStreamer()
-        self.webull_streamer.start()
 
     async def close(self) -> None:
         if self.webull_streamer is not None:

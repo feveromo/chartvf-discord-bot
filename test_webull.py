@@ -1,7 +1,10 @@
 import asyncio
 import datetime as dt
+import json
 import struct
+import threading
 import time
+from types import SimpleNamespace
 from typing import Any, cast
 
 import aiohttp
@@ -10,7 +13,9 @@ from charting import ChartData, ChartRequest, ChartRow, NoChartData, aggregate_c
 from market_data import fetch_market_chart_data
 from webull import (
     RESOLUTION_CACHE_SIZE,
+    STREAM_IDLE_SECONDS,
     LiveQuote,
+    WebullStreamer,
     WebullProviderError,
     decode_quote_payload,
     fetch_intraday_bars,
@@ -411,6 +416,124 @@ class StubStreamer:
         return self.live
 
 
+class FakeMqttClient:
+    def __init__(self) -> None:
+        self.subscribed: list[str] = []
+        self.unsubscribed: list[str] = []
+        self.disconnected = False
+
+    def subscribe(self, topic: str) -> None:
+        self.subscribed.append(topic)
+
+    def unsubscribe(self, topic: str) -> None:
+        self.unsubscribed.append(topic)
+
+    def disconnect(self) -> None:
+        self.disconnected = True
+
+    def loop_stop(self) -> None:
+        pass
+
+
+CONNACK_OK = SimpleNamespace(is_failure=False)
+CONN_LOST = SimpleNamespace(is_failure=True)
+
+
+def offline_streamer() -> tuple[WebullStreamer, list[FakeMqttClient]]:
+    """A streamer whose connects hand out fake clients instead of sockets."""
+    streamer = WebullStreamer()
+    started: list[FakeMqttClient] = []
+
+    def fake_start() -> Any:
+        client = FakeMqttClient()
+        streamer._client = cast(Any, client)
+        streamer._stopped = threading.Event()
+        started.append(client)
+        return client
+
+    streamer._start_locked = fake_start  # type: ignore[method-assign]
+    return streamer, started
+
+
+def ticker_topics(client: FakeMqttClient) -> list[int]:
+    return [json.loads(topic)["tickerIds"][0] for topic in client.subscribed if "tickerIds" in topic]
+
+
+def hellos(client: FakeMqttClient) -> int:
+    return sum("header" in topic for topic in client.subscribed)
+
+
+def test_streamer_connects_on_first_subscription() -> None:
+    streamer, started = offline_streamer()
+    assert started == []  # nothing at startup
+    streamer.subscribe(1)
+    streamer.subscribe(2)
+    streamer.subscribe(1)
+    assert len(started) == 1
+    client = started[0]
+    assert client.subscribed == []  # _on_connect subscribes what is pending
+    streamer._on_connect(cast(Any, client), None, None, CONNACK_OK)
+    assert streamer.connected
+    assert hellos(client) == 1
+    assert sorted(ticker_topics(client)) == [1, 2]
+    streamer.subscribe(3)
+    streamer.subscribe(3)
+    assert ticker_topics(client).count(3) == 1
+
+
+def test_streamer_heartbeat_resends_hello_and_expires_idle_tickers() -> None:
+    streamer, started = offline_streamer()
+    streamer.subscribe(1)
+    streamer.subscribe(2)
+    client = started[0]
+    streamer._on_connect(cast(Any, client), None, None, CONNACK_OK)
+    streamer._subscriptions[1] -= STREAM_IDLE_SECONDS + 1
+    streamer._latest[1] = LiveQuote(1.0, int(time.time() * 1000), "T")
+
+    assert streamer._beat(cast(Any, client))
+    assert hellos(client) == 2
+    assert [json.loads(topic)["tickerIds"] for topic in client.unsubscribed] == [[1]]
+    assert list(streamer._subscriptions) == [2]
+    assert streamer.latest(1) is None
+    assert not client.disconnected
+
+
+def test_streamer_disconnects_when_idle_and_reconnects_on_demand() -> None:
+    streamer, started = offline_streamer()
+    streamer.subscribe(1)
+    first = started[0]
+    streamer._on_connect(cast(Any, first), None, None, CONNACK_OK)
+    streamer._subscriptions[1] -= STREAM_IDLE_SECONDS + 1
+
+    assert not streamer._beat(cast(Any, first))
+    assert first.disconnected
+    assert not streamer.connected
+    assert streamer._client is None
+    # Late callbacks from the retired client change nothing.
+    streamer._on_disconnect(cast(Any, first), None, None, CONN_LOST)
+    assert not streamer._beat(cast(Any, first))
+
+    streamer.subscribe(1)
+    assert len(started) == 2
+    second = started[1]
+    streamer._on_connect(cast(Any, first), None, None, CONNACK_OK)
+    assert not streamer.connected
+    streamer._on_connect(cast(Any, second), None, None, CONNACK_OK)
+    assert streamer.connected
+    assert ticker_topics(second) == [1]
+
+
+def test_streamer_stop_retires_client() -> None:
+    streamer, started = offline_streamer()
+    streamer.subscribe(1)
+    client = started[0]
+    stopped = streamer._stopped
+    streamer.stop()
+    assert client.disconnected
+    assert stopped.is_set()
+    assert not streamer._beat(cast(Any, client))
+
+
 async def test_fetch_webull_intraday_uses_stream_price_when_live() -> None:
     session = session_for(
         {
@@ -571,6 +694,10 @@ async def run_tests() -> None:
     test_decode_quote_payload_real_capture_shape()
     test_decode_quote_payload_regular_session_uses_close_field()
     test_decode_quote_payload_rejects_garbage()
+    test_streamer_connects_on_first_subscription()
+    test_streamer_heartbeat_resends_hello_and_expires_idle_tickers()
+    test_streamer_disconnects_when_idle_and_reconnects_on_demand()
+    test_streamer_stop_retires_client()
     await test_fetch_webull_intraday_uses_stream_price_when_live()
     await test_fetch_webull_intraday_falls_back_to_snapshot_price()
     await test_fetch_webull_h4_preserves_native_session_alignment()
