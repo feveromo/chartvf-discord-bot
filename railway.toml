@@ -1,2 +1,13 @@
+[build]
+# Only runtime inputs redeploy; tests, docs and CI changes don't.
+watchPatterns = [
+  "/*.py",
+  "!/test_*.py",
+  "/requirements.txt",
+  "/.python-version",
+  "/pyproject.toml",
+  "/railway.toml",
+]
+
 [deploy]
 startCommand = "python main.py"
