@@ -6,15 +6,16 @@ from typing import Any, cast
 
 import aiohttp
 
-import main
-from charting import ChartRequest, NoChartData
+from charting import ChartData, ChartRequest, ChartRow, NoChartData, aggregate_chart_data
+from market_data import fetch_market_chart_data
 from webull import (
+    RESOLUTION_CACHE_SIZE,
     LiveQuote,
     WebullProviderError,
-    bucket_rows,
     decode_quote_payload,
     fetch_intraday_bars,
     fetch_realtime_quote,
+    fetch_webull_chart_data,
     patch_live_bar,
     resolve_ticker,
     snapshot_quote,
@@ -26,6 +27,7 @@ class FakeResponse:
     def __init__(self, status: int, payload: Any) -> None:
         self.status = status
         self.payload = payload
+        self.headers: dict[str, str] = {"Retry-After": "0"}
 
     async def __aenter__(self) -> "FakeResponse":
         return self
@@ -163,6 +165,24 @@ async def test_resolve_ticker_missing_symbol() -> None:
     session = session_for({SEARCH_URL: (200, {"data": []})})
     assert await resolve_ticker(session, "ZZZZ") is None
 
+    # Misses are cached briefly, not for a day: a transient empty search
+    # must not pin a real ticker to the fallback provider.
+    stored_at, _ = _resolution_cache["ZZZZ"]
+    _resolution_cache["ZZZZ"] = (stored_at - 11 * 60, None)
+    listed = session_for({SEARCH_URL: (200, {"data": [dict(SEARCH_PAYLOAD["data"][0], symbol="ZZZZ")]})})
+    found = await resolve_ticker(listed, "ZZZZ")
+    assert found is not None and found.ticker_id == 913256135
+
+
+async def test_resolve_ticker_cache_is_bounded() -> None:
+    _resolution_cache.clear()
+    session = session_for({SEARCH_URL: (200, {"data": []})})
+    for index in range(RESOLUTION_CACHE_SIZE + 5):
+        await resolve_ticker(session, f"Z{index}")
+    assert len(_resolution_cache) == RESOLUTION_CACHE_SIZE
+    assert "Z0" not in _resolution_cache
+    _resolution_cache.clear()
+
 
 async def test_fetch_intraday_bars_field_order_and_label_normalization() -> None:
     session = session_for({HISTORY_URL: (200, HISTORY_PAYLOAD)})
@@ -270,15 +290,16 @@ def test_snapshot_quote_regular_session_uses_preclose() -> None:
     assert session == "T"
 
 
-def test_bucket_rows_aggregates_and_aligns() -> None:
+def test_aggregation_keeps_live_flat_bar() -> None:
     base = (1787660280 // 300) * 300  # aligned to the 300s bucket grid
-    rows = [
-        (base, 100.0, 101.0, 99.0, 100.5, 10.0),
-        (base + 60, 100.5, 102.0, 100.0, 101.5, 20.0),
-        (base + 120, 101.5, 101.5, 98.0, 99.0, 5.0),
-        (base + 300, 99.0, 99.5, 98.5, 99.4, 7.0),
-    ]
-    bucketed = bucket_rows(rows, 300)
+    rows = (
+        ChartRow(base, 100.0, 101.0, 99.0, 100.5, 10.0),
+        ChartRow(base + 60, 100.5, 102.0, 100.0, 101.5, 20.0),
+        ChartRow(base + 120, 101.5, 101.5, 98.0, 99.0, 5.0),
+        ChartRow(base + 300, 99.4, 99.4, 99.4, 99.4, 0.0),  # live flat bar
+    )
+    data = ChartData("AAPL", "Apple", rows, source_interval_seconds=60, preserve_last_bar=True)
+    bucketed = aggregate_chart_data(data, ChartRequest("AAPL", "i5", "5 min")).rows
     assert len(bucketed) == 2
     epoch, open_, high, low, close, volume = bucketed[0]
     assert epoch == base
@@ -400,14 +421,12 @@ async def test_fetch_webull_intraday_uses_stream_price_when_live() -> None:
     )
     now_ms = int(time.time() * 1000)
     streamer = StubStreamer(LiveQuote(311.50, now_ms, "F"))
-    main.client.webull_streamer = cast(Any, streamer)
     _resolution_cache.clear()
-    try:
-        data = await main.fetch_webull_intraday_chart_data(
-            session, ChartRequest(ticker="AAPL", timeframe="i1", timeframe_label="1 min")
-        )
-    finally:
-        main.client.webull_streamer = None
+    data = await fetch_webull_chart_data(
+        session,
+        ChartRequest(ticker="AAPL", timeframe="i1", timeframe_label="1 min"),
+        cast(Any, streamer),
+    )
 
     assert data.market_label == "Webull real-time"
     assert data.name == "Apple Inc"
@@ -427,9 +446,8 @@ async def test_fetch_webull_intraday_falls_back_to_snapshot_price() -> None:
             REALTIME_URL: (200, REGULAR_REALTIME_PAYLOAD),
         }
     )
-    main.client.webull_streamer = None
     _resolution_cache.clear()
-    data = await main.fetch_webull_intraday_chart_data(
+    data = await fetch_webull_chart_data(
         session, ChartRequest(ticker="AAPL", timeframe="i1", timeframe_label="1 min")
     )
     assert data.last_close == 310.25
@@ -455,9 +473,8 @@ async def test_fetch_webull_h4_preserves_native_session_alignment() -> None:
             REALTIME_URL: (200, REGULAR_REALTIME_PAYLOAD),
         }
     )
-    main.client.webull_streamer = None
     _resolution_cache.clear()
-    data = await main.fetch_webull_intraday_chart_data(
+    data = await fetch_webull_chart_data(
         session, ChartRequest(ticker="AAPL", timeframe="h4", timeframe_label="4 hour")
     )
     assert [row.epoch for row in data.rows] == [1787659200, 1787664600]
@@ -468,7 +485,7 @@ async def test_fetch_webull_intraday_unknown_ticker_raises_no_chart_data() -> No
     session = session_for({SEARCH_URL: (200, {"data": []})})
     _resolution_cache.clear()
     try:
-        await main.fetch_webull_intraday_chart_data(
+        await fetch_webull_chart_data(
             session, ChartRequest(ticker="AAPL", timeframe="i1", timeframe_label="1 min")
         )
     except NoChartData:
@@ -505,7 +522,7 @@ async def test_dispatch_falls_back_to_tradingview_on_webull_provider_error() -> 
     session = session_for({SEARCH_URL: (500, {}), "__ws__": ws_messages})
     _resolution_cache.clear()
     request = ChartRequest(ticker="AAPL", timeframe="i5", timeframe_label="5 min")
-    data = await main.fetch_market_chart_data(session, request)
+    data = await fetch_market_chart_data(session, request)
     assert data.market_label == "TradingView 24h"
 
 
@@ -520,7 +537,7 @@ async def test_dispatch_falls_back_when_webull_history_is_empty() -> None:
     )
     _resolution_cache.clear()
     request = ChartRequest(ticker="AAPL", timeframe="i5", timeframe_label="5 min")
-    data = await main.fetch_market_chart_data(session, request)
+    data = await fetch_market_chart_data(session, request)
     assert data.market_label == "TradingView 24h"
 
 
@@ -533,20 +550,21 @@ async def test_dispatch_falls_back_when_webull_cannot_resolve_symbol() -> None:
     )
     _resolution_cache.clear()
     request = ChartRequest(ticker="AAPL", timeframe="i5", timeframe_label="5 min")
-    data = await main.fetch_market_chart_data(session, request)
+    data = await fetch_market_chart_data(session, request)
     assert data.market_label == "TradingView 24h"
 
 
 async def run_tests() -> None:
     await test_resolve_ticker_caches_results()
     await test_resolve_ticker_missing_symbol()
+    await test_resolve_ticker_cache_is_bounded()
     await test_fetch_intraday_bars_field_order_and_label_normalization()
     await test_fetch_intraday_bars_uses_native_interval_and_pages_without_duplicates()
     await test_fetch_intraday_bars_normalizes_partial_h4_session_bars()
     await test_fetch_realtime_quote_empty_list_is_provider_error()
     test_snapshot_quote_premarket_uses_close_as_previous()
     test_snapshot_quote_regular_session_uses_preclose()
-    test_bucket_rows_aggregates_and_aligns()
+    test_aggregation_keeps_live_flat_bar()
     test_patch_live_bar_updates_forming_bucket()
     test_patch_live_bar_appends_accurate_flat_next_bucket()
     test_patch_live_bar_uses_webull_hourly_session_alignment()

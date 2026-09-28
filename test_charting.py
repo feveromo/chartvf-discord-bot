@@ -18,7 +18,6 @@ from charting import (
     STOCK_INTRADAY_VISIBLE_BARS,
     STOCK_MONTHLY_VISIBLE_BARS,
     STOCK_WEEKLY_VISIBLE_BARS,
-    YAHOO_SYMBOL_ALIASES,
     ChartData,
     ChartRequest,
     _blend_rgb,
@@ -32,7 +31,6 @@ from charting import (
     _chart_rows as chart_rows,
     _month_tick_label,
     _nice_linear_axis,
-    _source_interval_seconds,
     _stock_5m_today_indexes,
     _stock_extended_session_bands,
     _stock_extended_session_key,
@@ -42,13 +40,18 @@ from charting import (
     _x_grid_line_styles,
     aggregate_chart_data,
     chart_title,
+    native_timeframe,
     parse_chart_command,
-    latest_quote_price_time,
     normalize_chart_rows,
-    patch_close_only_latest_ohlc,
     quote_description as describe_chart_data,
     render_price_chart_png as render_chart_data_png,
     safe_float,
+)
+from yahoo import (
+    YAHOO_INTERVALS,
+    YAHOO_SYMBOL_ALIASES,
+    latest_quote_price_time,
+    patch_close_only_latest_ohlc,
     stock_previous_close,
     yahoo_chart_url,
 )
@@ -77,10 +80,9 @@ def _chart_data(raw: dict[str, Any]) -> ChartData:
         last_close=last_close,
         last_time=int(last_time) if (last_time := safe_float(raw.get("lastTime"))) is not None else None,
         previous_close=safe_float(raw.get("prevClose")),
-        change=safe_float(raw.get("perfDayUsd")),
-        change_percent=safe_float(raw.get("perfDayPct")),
         market_label=str(raw.get("marketLabel") or ""),
         futures=bool(raw.get("futures")),
+        source_interval_seconds=raw.get("sourceIntervalSeconds"),
         preserve_last_bar=bool(raw.get("preserveLastBar")),
     )
 
@@ -112,6 +114,24 @@ def test_charting_regressions() -> None:
     assert parse_chart_command(";") is None
     assert parse_chart_command(";help") is None
     assert parse_chart_command(";aapl") == ChartRequest("AAPL", "i5", "5 min")
+    for chatter in (";)", ";(", ";-;", ";_;", ";;", ";p", ";P", ";D", ";p lol", ";D nice one", ";'("):
+        assert parse_chart_command(chatter) is None, chatter
+    assert parse_chart_command(";d") == ChartRequest("D", "i5", "5 min")
+    assert parse_chart_command(";D d") == ChartRequest("D", "d", "daily")
+    assert parse_chart_command(";o") == ChartRequest("O", "i5", "5 min")
+    for explicit_bad_ticker in (";chart )", ";fut ???"):
+        try:
+            parse_chart_command(explicit_bad_ticker)
+        except ValueError as error:
+            assert "looks wrong" in str(error)
+        else:
+            raise AssertionError("explicit chart commands should explain a bad ticker")
+    try:
+        parse_chart_command(";aapl dialy")
+    except ValueError as error:
+        assert "Unknown chart option `dialy`" in str(error)
+    else:
+        raise AssertionError("typos after a real ticker should still get feedback")
     assert parse_chart_command(";aapl d") == ChartRequest("AAPL", "d", "daily")
     assert parse_chart_command(";brk.b w line") == ChartRequest("BRK-B", "w", "weekly", "l", "line")
     assert parse_chart_command(";aapl m line dark log") == ChartRequest(
@@ -285,8 +305,8 @@ def test_charting_regressions() -> None:
     )
     volume_rows = [(i, 1.0, 1.0, 1.0, 1.0, float(i + 1)) for i in range(100)]
     volume_rows.append((101, 1.0, 1.0, 1.0, 1.0, 10_000.0))
-    assert _volume_scale_value(volume_rows, ChartRequest("AMD", "i5", "5 min")) == 10_000.0
-    assert _volume_scale_value(volume_rows, ChartRequest("AMD", "d", "daily")) == 10_000.0
+    assert _volume_scale_value(volume_rows) == 10_000.0
+    assert _volume_scale_value([]) == 0.0
     def et_epoch(hour: int, minute: int, day: int = 15) -> int:
         return int(dt.datetime(2026, 6, day, hour, minute, tzinfo=MARKET_TIME_ZONE).timestamp())
     mes_description = quote_description({
@@ -294,8 +314,7 @@ def test_charting_regressions() -> None:
         "futures": True,
         "name": "MICRO E-MINI S&P 500 INDEX FUTU",
         "lastClose": 7588,
-        "perfDayUsd": 26.5,
-        "perfDayPct": 0.35,
+        "prevClose": 7561.5,
         "lastTime": et_epoch(18, 2),
     })
     assert mes_description == "Micro E-mini S&P 500\nLast **7,588** · **+26.50** (+0.35%) · 6:02 PM ET"
@@ -339,8 +358,10 @@ def test_charting_regressions() -> None:
         "close": [10.5, 12],
         "volume": [100, 0],
     }
-    assert _source_interval_seconds(ChartRequest("ES", "i10", "10 min", futures=True)) == 5 * 60
-    assert _source_interval_seconds(ChartRequest("ES", "h2", "2 hour", futures=True)) == 60 * 60
+    assert native_timeframe("i10", YAHOO_INTERVALS) == "i5"
+    assert native_timeframe("i3", YAHOO_INTERVALS) == "i1"
+    assert native_timeframe("h2", YAHOO_INTERVALS) == "h"
+    assert native_timeframe("h4", YAHOO_INTERVALS) == "h4"
     assert len(_quote_rows(live_quote_rows, ChartRequest("AMD", "i5", "5 min"))) == 1
     assert len(_quote_rows(
         dict(live_quote_rows, preserveLastBar=True),
@@ -506,6 +527,7 @@ def test_charting_regressions() -> None:
         "low": [9, 10, 11, 12],
         "close": [10.5, 11.5, 12.5, 13.5],
         "volume": [1, 2, 3, 4],
+        "sourceIntervalSeconds": 60,
     }, ChartRequest("ES", "i3", "3 min", futures=True))
     assert [row.epoch for row in aggregated.rows] == [0, 180]
     assert [row.open for row in aggregated.rows] == [10.0, 13.0]
@@ -521,6 +543,7 @@ def test_charting_regressions() -> None:
         "low": [9, 10, 11, 12],
         "close": [10.5, 11.5, 12.5, 13.5],
         "volume": [1, 2, 3, 4],
+        "sourceIntervalSeconds": 60,
     }, ChartRequest("AMD", "i3", "3 min"))
     assert [row.epoch for row in stock_aggregated.rows] == [0, 180]
     assert [row.open for row in stock_aggregated.rows] == [10.0, 13.0]

@@ -38,6 +38,9 @@ Options can be in any order after the ticker.
 | `;futures GC 1y` | 1-year gold futures |
 | `;help` | command help |
 
+Chat that just happens to start with `;` is ignored: faces like `;)`, `;_;`, `;p`, and `;D`
+don't trigger the bot. `;d` or `;D d` still charts Dominion Energy (`D`).
+
 <img width="1280" height="478" alt="ES_i15_1781687948" src="https://github.com/user-attachments/assets/d98b2db3-8256-4c99-82cc-2519e2efda7a" />
 
 
@@ -91,12 +94,23 @@ This bot is a long-running Discord worker, not an HTTP web service, so it does n
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-python test_charting.py
-python test_main.py
-python test_rendering.py
-python test_webull.py
-python -m py_compile main.py charting.py webull.py test_charting.py test_main.py test_rendering.py test_webull.py
-pyright --pythonpath .venv/bin/python main.py charting.py webull.py test_charting.py test_main.py test_rendering.py test_webull.py
-ruff check main.py charting.py webull.py test_charting.py test_main.py test_rendering.py test_webull.py
+for test in test_*.py; do python "$test"; done
+pyright
+ruff check
 pip check
 ```
+
+Run them from an activated virtualenv so `pyright` picks up its packages.
+
+## Layout
+
+| File | What it does |
+| --- | --- |
+| `main.py` | Discord bot: commands, replies, embeds |
+| `charting.py` | command parsing, timeframes, chart data model, PNG rendering |
+| `market_data.py` | picks the provider for each request |
+| `webull.py` | real-time stock intraday (REST + MQTT tick stream) |
+| `tradingview.py` | futures intraday and the stock intraday fallback |
+| `crypto.py` | OKX perpetuals and Binance spot |
+| `yahoo.py` | indexes, daily/weekly/monthly, unmapped futures |
+| `market_http.py` | shared HTTP session, retries, provider errors |

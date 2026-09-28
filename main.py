@@ -1,67 +1,29 @@
 import asyncio
-import datetime as dt
+import contextlib
 import io
-import json
-from json import JSONDecodeError
 import logging
 import os
-import secrets
 import sys
 import time
-from typing import Any
-
-from charting import (
-    BINANCE_CRYPTO_SYMBOLS,
-    MARKET_TIME_ZONE,
-    PREFIX,
-    REGULAR_SESSION_END,
-    REGULAR_SESSION_START,
-    YAHOO_SYMBOL_ALIASES,
-    ChartData,
-    ChartRequest,
-    ChartRow,
-    NoChartData,
-    aggregate_chart_data,
-    chart_title,
-    has_close_only_latest_ohlc,
-    latest_quote_price_time,
-    normalize_chart_rows,
-    parse_chart_command,
-    patch_close_only_latest_ohlc,
-    quote_description,
-    render_price_chart_png,
-    safe_float,
-    stock_previous_close,
-    yahoo_chart_url,
-)
+from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
 import discord
 from dotenv import load_dotenv
 
-from webull import (
-    STOCK_INTERVAL_SECONDS as WEBULL_STOCK_INTERVAL_SECONDS,
-    LiveQuote,
-    WebullProviderError,
-    WebullStreamer,
-    bucket_rows,
-    fetch_intraday_bars,
-    fetch_realtime_quote,
-    patch_live_bar,
-    resolve_ticker,
-    snapshot_quote,
+from charting import (
+    HELP_COMMANDS,
+    PREFIX,
+    ChartRequest,
+    NoChartData,
+    chart_title,
+    parse_chart_command,
+    quote_description,
+    render_price_chart_png,
 )
-
-
-class MarketDataProviderError(RuntimeError):
-    pass
-
-
-class MarketDataHTTPError(MarketDataProviderError):
-    def __init__(self, status: int) -> None:
-        self.status = status
-        super().__init__(f"Market data provider returned HTTP {status}")
-
+from market_data import fetch_market_chart_data
+from market_http import PROVIDER_ERRORS, create_session
+from webull import WebullStreamer
 
 HELP_TEXT = """**ChartVF**
 
@@ -95,6 +57,8 @@ Options can be in any order after the ticker.
 
 **Futures** (`;fut`/`;future`/`;futures`): `;f` is still Ford (`F`).
 
+**Faces**: `;)`, `;p`, and `;D` on their own are left alone; `;d` or `;D d` charts Dominion.
+
 **Freshness**: bare stock, futures, and crypto commands default to the latest 5-minute chart.
 Stock intraday charts use real-time Webull candles (tick-level push, pre/post market included),
 with TradingView 24-hour candles as fallback.
@@ -105,114 +69,30 @@ Binance spot chart history. Every chart image is
 rendered locally from market chart data.
 """
 
-HTTP_TIMEOUT = aiohttp.ClientTimeout(total=12, connect=4, sock_read=8)
+# Budget for the network fetch only; rendering is local and fast.
 MARKET_DATA_BUDGET_SECONDS = 15
-MAX_CONCURRENT_FETCHES = 4
-MAX_RETRY_AFTER_SECONDS = 1.5
-BINANCE_SPOT_BASE_URL = "https://data-api.binance.vision"
-BINANCE_FUTURES_BASE_URL = "https://fapi.binance.com"
-BINANCE_KLINE_LIMITS = {"spot": 1000, "perp": 1500}
-OKX_BASE_URL = "https://www.okx.com"
-BINANCE_INTERVALS = {
-    "d": "1d",
-    "w": "1w",
-    "m": "1M",
-    "i1": "1m",
-    "i2": "1m",
-    "i3": "3m",
-    "i5": "5m",
-    "i10": "5m",
-    "i15": "15m",
-    "i30": "30m",
-    "h": "1h",
-    "h2": "2h",
-    "h4": "4h",
-}
-OKX_INTERVALS = {
-    "d": "1Dutc",
-    "w": "1Wutc",
-    "m": "1Mutc",
-    "i1": "1m",
-    "i2": "1m",
-    "i3": "3m",
-    "i5": "5m",
-    "i10": "5m",
-    "i15": "15m",
-    "i30": "30m",
-    "h": "1H",
-    "h2": "2H",
-    "h4": "4H",
-}
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0 Safari/537.36"
-)
-TRADINGVIEW_WS_URL = "wss://data.tradingview.com/socket.io/websocket?from=chart%2F"
-TRADINGVIEW_FUTURES_SYMBOLS = {
-    "ES": "CME_MINI:ES1!",
-    "MES": "CME_MINI:MES1!",
-    "NQ": "CME_MINI:NQ1!",
-    "MNQ": "CME_MINI:MNQ1!",
-    "YM": "CBOT_MINI:YM1!",
-    "MYM": "CBOT_MINI:MYM1!",
-    "RTY": "CME_MINI:RTY1!",
-    "M2K": "CME_MINI:M2K1!",
-    "CL": "NYMEX:CL1!",
-    "GC": "COMEX:GC1!",
-    "6E": "CME:6E1!",
-}
-TRADINGVIEW_INTERVALS = {
-    "i1": "1",
-    "i2": "2",
-    "i3": "3",
-    "i5": "5",
-    "i10": "10",
-    "i15": "15",
-    "i30": "30",
-    "h": "60",
-    "h2": "120",
-    "h4": "240",
-}
-TRADINGVIEW_INTERVAL_SECONDS = {
-    "i1": 60,
-    "i2": 2 * 60,
-    "i3": 3 * 60,
-    "i5": 5 * 60,
-    "i10": 10 * 60,
-    "i15": 15 * 60,
-    "i30": 30 * 60,
-    "h": 60 * 60,
-    "h2": 2 * 60 * 60,
-    "h4": 4 * 60 * 60,
-}
-TRADINGVIEW_HISTORY_BARS = 400
-
+# Renders take ~30 ms and overlap well; two threads finish a 10-chart burst in
+# ~0.25 s while keeping memory flat on hosts that report many CPUs.
+RENDER_WORKERS = 2
+UNAVAILABLE_MESSAGE = "Market data is temporarily unavailable. Try again in a minute."
+ERROR_MESSAGE = "Something went wrong making that chart."
+NO_MENTIONS = discord.AllowedMentions.none()
 LOGGER = logging.getLogger("chartvf")
-FETCH_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
-RENDER_SEMAPHORE = asyncio.Semaphore(1)
 
 
 class ChartBot(discord.Client):
-    session: aiohttp.ClientSession | None = None
-    webull_streamer: WebullStreamer | None = None
+    def __init__(self) -> None:
+        intents = discord.Intents.none()
+        intents.guilds = True
+        intents.messages = True
+        intents.message_content = True
+        super().__init__(intents=intents, max_messages=0, allowed_mentions=NO_MENTIONS)
+        self.session: aiohttp.ClientSession | None = None
+        self.webull_streamer: WebullStreamer | None = None
+        self.render_pool = ThreadPoolExecutor(RENDER_WORKERS, thread_name_prefix="render")
 
     async def setup_hook(self) -> None:
-        connector = aiohttp.TCPConnector(
-            limit=8,
-            limit_per_host=4,
-            ttl_dns_cache=300,
-        )
-        self.session = aiohttp.ClientSession(
-            timeout=HTTP_TIMEOUT,
-            connector=connector,
-            cookie_jar=aiohttp.DummyCookieJar(),
-            headers={
-                "User-Agent": USER_AGENT,
-                "Cache-Control": "no-cache",
-                "Accept": "application/json",
-            },
-        )
+        self.session = create_session()
         self.webull_streamer = WebullStreamer()
         self.webull_streamer.start()
 
@@ -223,1059 +103,90 @@ class ChartBot(discord.Client):
         if self.session is not None:
             await self.session.close()
             self.session = None
+        self.render_pool.shutdown(wait=False, cancel_futures=True)
         await super().close()
 
+    async def on_ready(self) -> None:
+        LOGGER.info("gateway_ready")
 
-intents = discord.Intents.none()
-intents.guilds = True
-intents.messages = True
-intents.message_content = True
-client = ChartBot(intents=intents, max_messages=0)
-NO_MENTIONS = discord.AllowedMentions.none()
-
-
-@client.event
-async def on_ready() -> None:
-    LOGGER.info("gateway_ready")
-
-
-@client.event
-async def on_message(message: discord.Message) -> None:
-    if message.author.bot or not message.content.startswith(PREFIX):
-        return
-
-    command_text = message.content[len(PREFIX) :].strip()
-    if not command_text:
-        await message.channel.send(HELP_TEXT, allowed_mentions=NO_MENTIONS)
-        return
-    if command_text.split(maxsplit=1)[0].lower() in {"help", "h"}:
-        await message.channel.send(HELP_TEXT, allowed_mentions=NO_MENTIONS)
-        return
-
-    try:
-        request = parse_chart_command(message.content)
-    except ValueError as error:
-        await message.channel.send(str(error), allowed_mentions=NO_MENTIONS)
-        return
-
-    if request:
-        await send_chart(message.channel, request)
-
-
-async def _request_json(
-    session: aiohttp.ClientSession,
-    url: str,
-    *,
-    params: dict[str, Any] | None = None,
-) -> Any:
-    for attempt in range(2):
+    async def on_message(self, message: discord.Message) -> None:
+        # discord.py runs each event in its own task, so rapid-fire commands
+        # fetch and render concurrently.
+        if message.author.bot or not message.content.startswith(PREFIX):
+            return
+        words = message.content[len(PREFIX):].split(maxsplit=1)
+        if not words or words[0].lower() in HELP_COMMANDS:
+            await message.channel.send(HELP_TEXT)
+            return
         try:
-            async with session.get(url, params=params) as response:
-                if response.status in {429, 500, 502, 503, 504} and attempt == 0:
-                    retry_after = (
-                        safe_float(response.headers.get("Retry-After")) or 0.25
+            request = parse_chart_command(message.content)
+        except ValueError as error:
+            await message.channel.send(str(error))
+            return
+        if request is not None:
+            await self.send_chart(message.channel, request)
+
+    async def send_chart(
+        self, channel: discord.abc.Messageable, request: ChartRequest
+    ) -> None:
+        try:
+            await self._send_chart(channel, request)
+        except Exception:
+            LOGGER.exception("chart outcome=error ticker=%s", request.ticker)
+            with contextlib.suppress(discord.HTTPException):
+                await channel.send(ERROR_MESSAGE)
+
+    async def _send_chart(
+        self, channel: discord.abc.Messageable, request: ChartRequest
+    ) -> None:
+        if self.session is None:
+            await channel.send(UNAVAILABLE_MESSAGE)
+            return
+        started = time.perf_counter()
+        async with channel.typing():
+            try:
+                async with asyncio.timeout(MARKET_DATA_BUDGET_SECONDS):
+                    data = await fetch_market_chart_data(
+                        self.session, request, self.webull_streamer
                     )
-                    await asyncio.sleep(min(retry_after, MAX_RETRY_AFTER_SECONDS))
-                    continue
-                if response.status != 200:
-                    raise MarketDataHTTPError(response.status)
-                try:
-                    return await response.json(content_type=None)
-                except (JSONDecodeError, aiohttp.ContentTypeError) as error:
-                    raise MarketDataProviderError(
-                        "Market data provider returned malformed JSON"
-                    ) from error
-        except aiohttp.ClientError, TimeoutError:
-            if attempt == 0:
-                continue
-            raise
-    raise MarketDataProviderError("Market data provider returned an error")
-
-
-def _chart_result(data: Any, ticker: str) -> dict[str, Any]:
-    if not isinstance(data, dict):
-        raise MarketDataProviderError("Market data provider returned malformed data")
-    chart = data.get("chart") or {}
-    error = chart.get("error")
-    if error:
-        code = str(error.get("code") if isinstance(error, dict) else error).lower()
-        description = str(
-            error.get("description") if isinstance(error, dict) else ""
-        ).lower()
-        if (
-            "not found" in code
-            or "not found" in description
-            or "no data" in description
-        ):
-            raise NoChartData(f"No chart data found for `{ticker}`.")
-        raise MarketDataProviderError("Market data provider returned an error")
-    results = chart.get("result") or []
-    if not results or not isinstance(results[0], dict):
-        raise NoChartData(f"No chart data found for `{ticker}`.")
-    return results[0]
-
-
-async def fetch_daily_previous_close(
-    session: aiohttp.ClientSession, request: ChartRequest
-) -> float | None:
-    daily_request = ChartRequest(
-        ticker=request.ticker,
-        timeframe="d",
-        timeframe_label="daily",
-        date_range="m1",
-        date_range_label="1 month",
-        futures=request.futures,
-    )
-    try:
-        data = await _request_json(session, yahoo_chart_url(daily_request))
-        result = _chart_result(data, request.ticker)
-    except (
-        aiohttp.ClientError,
-        TimeoutError,
-        JSONDecodeError,
-        MarketDataProviderError,
-        NoChartData,
-    ):
-        return None
-    raw_quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
-    closes = raw_quote.get("close") or []
-    valid_closes = [
-        close for close in (safe_float(value) for value in closes) if close is not None
-    ]
-    return valid_closes[-2] if len(valid_closes) > 1 else None
-
-
-async def fetch_current_day_intraday_quote(
-    session: aiohttp.ClientSession, request: ChartRequest
-) -> dict[str, Any] | None:
-    intraday_request = ChartRequest(
-        ticker=request.ticker,
-        timeframe="i1",
-        timeframe_label="1 min",
-        futures=request.futures,
-    )
-    intraday_url = (
-        yahoo_chart_url(intraday_request)
-        .replace("range=5d", "range=1d")
-        .replace(
-            "includePrePost=true",
-            "includePrePost=false",
-        )
-    )
-    try:
-        result = _chart_result(
-            await _request_json(session, intraday_url), request.ticker
-        )
-    except (
-        aiohttp.ClientError,
-        TimeoutError,
-        JSONDecodeError,
-        MarketDataProviderError,
-        NoChartData,
-    ):
-        return None
-    raw_quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
-    return {
-        "date": result.get("timestamp") or [],
-        "open": raw_quote.get("open") or [],
-        "high": raw_quote.get("high") or [],
-        "low": raw_quote.get("low") or [],
-        "close": raw_quote.get("close") or [],
-        "volume": raw_quote.get("volume") or [],
-    }
-
-
-def _binance_interval(request: ChartRequest) -> str:
-    interval = BINANCE_INTERVALS.get(request.timeframe)
-    if interval is None:
-        raise ValueError(
-            f"Binance chart data does not support `{request.timeframe_label}` charts."
-        )
-    return interval
-
-
-def _okx_interval(request: ChartRequest) -> str:
-    interval = OKX_INTERVALS.get(request.timeframe)
-    if interval is None:
-        raise ValueError(
-            f"OKX chart data does not support `{request.timeframe_label}` charts."
-        )
-    return interval
-
-
-def _crypto_auto_market(request: ChartRequest) -> str:
-    if request.crypto_market != "auto":
-        return request.crypto_market or "spot"
-    return "perp" if request.timeframe.startswith(("i", "h")) else "spot"
-
-
-PROVIDER_INTERVAL_SECONDS = {
-    "1m": 60,
-    "3m": 3 * 60,
-    "5m": 5 * 60,
-    "15m": 15 * 60,
-    "30m": 30 * 60,
-    "1h": 60 * 60,
-    "1H": 60 * 60,
-    "2h": 2 * 60 * 60,
-    "2H": 2 * 60 * 60,
-    "4h": 4 * 60 * 60,
-    "4H": 4 * 60 * 60,
-    "1d": 86400,
-    "1Dutc": 86400,
-    "1w": 7 * 86400,
-    "1Wutc": 7 * 86400,
-    "1M": 30 * 86400,
-    "1Mutc": 30 * 86400,
-}
-DATE_RANGE_DAYS = {
-    "m1": 31,
-    "m3": 93,
-    "m6": 186,
-    "y1": 365,
-    "y2": 730,
-    "y5": 1826,
-}
-
-
-def _source_interval_seconds(interval: str) -> int | None:
-    return PROVIDER_INTERVAL_SECONDS.get(interval)
-
-
-def _history_start_ms(request: ChartRequest, interval_seconds: int) -> int | None:
-    if request.date_range == "max":
-        return 0
-    now = int(time.time())
-    if request.date_range == "ytd":
-        current = dt.datetime.fromtimestamp(now, dt.timezone.utc)
-        cutoff = int(
-            dt.datetime(current.year, 1, 1, tzinfo=dt.timezone.utc).timestamp()
-        )
-    else:
-        days = DATE_RANGE_DAYS.get(request.date_range)
-        if days is None:
-            return None
-        cutoff = now - days * 86400
-    return max(0, (cutoff - 199 * interval_seconds) * 1000)
-
-
-def _dedupe_rows(rows: list[list[Any]]) -> list[list[Any]]:
-    unique: dict[int, list[Any]] = {}
-    for row in rows:
-        if not isinstance(row, list) or len(row) < 6:
-            continue
-        timestamp = safe_float(row[0])
-        if timestamp is not None:
-            unique[int(timestamp)] = row
-    return [unique[timestamp] for timestamp in sorted(unique)]
-
-
-async def _fetch_binance_klines(
-    session: aiohttp.ClientSession,
-    request: ChartRequest,
-    market: str,
-) -> list[list[Any]]:
-    symbol = BINANCE_CRYPTO_SYMBOLS[request.ticker][0]
-    interval = _binance_interval(request)
-    limit = BINANCE_KLINE_LIMITS[market]
-    base_url = BINANCE_FUTURES_BASE_URL if market == "perp" else BINANCE_SPOT_BASE_URL
-    path = "/fapi/v1/klines" if market == "perp" else "/api/v3/klines"
-    interval_seconds = _source_interval_seconds(interval)
-    if interval_seconds is None:
-        raise ValueError(f"Unsupported crypto interval `{interval}`.")
-    rows: list[list[Any]] = []
-    start_time = _history_start_ms(request, interval_seconds)
-
-    while True:
-        params: dict[str, Any] = {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
-        }
-        if start_time is not None:
-            params["startTime"] = start_time
-        try:
-            data = await _request_json(session, f"{base_url}{path}", params=params)
-        except MarketDataHTTPError as error:
-            if error.status == 404:
-                raise NoChartData(
-                    f"No chart data found for `{request.ticker}`."
-                ) from error
-            raise
-        if not isinstance(data, list) or not data:
-            break
-        page = [row for row in data if isinstance(row, list) and len(row) >= 6]
-        rows.extend(page)
-        if start_time is None or len(data) < limit or not page:
-            break
-        next_start_time = int(page[-1][0]) + 1
-        if next_start_time <= start_time or next_start_time >= int(time.time() * 1000):
-            break
-        start_time = next_start_time
-
-    rows = _dedupe_rows(rows)
-    if not rows:
-        raise NoChartData(f"No chart data found for `{request.ticker}`.")
-    return rows
-
-
-async def _fetch_okx_swap_klines(
-    session: aiohttp.ClientSession, request: ChartRequest
-) -> list[list[Any]]:
-    symbol = BINANCE_CRYPTO_SYMBOLS[request.ticker][0].replace("USDT", "-USDT-SWAP")
-    interval = _okx_interval(request)
-    interval_seconds = _source_interval_seconds(interval)
-    if interval_seconds is None:
-        raise ValueError(f"Unsupported crypto interval `{interval}`.")
-    cutoff = _history_start_ms(request, interval_seconds)
-    rows: list[list[Any]] = []
-    after: int | None = None
-    while True:
-        params: dict[str, Any] = {
-            "instId": symbol,
-            "bar": interval,
-            "limit": 300,
-        }
-        if after is not None:
-            params["after"] = after
-        try:
-            data = await _request_json(
-                session, f"{OKX_BASE_URL}/api/v5/market/history-candles", params=params
-            )
-        except MarketDataHTTPError as error:
-            if error.status == 404:
-                raise NoChartData(
-                    f"No chart data found for `{request.ticker}`."
-                ) from error
-            raise
-        if not isinstance(data, dict) or data.get("code") != "0":
-            raise MarketDataProviderError("Market data provider returned an error")
-        page = data.get("data") or []
-        if not isinstance(page, list) or not page:
-            break
-        valid_page = [row for row in page if isinstance(row, list) and len(row) >= 7]
-        rows.extend(valid_page)
-        if not valid_page or len(page) < 300:
-            break
-        oldest = min(int(row[0]) for row in valid_page)
-        if cutoff is None or oldest <= cutoff or oldest == after:
-            break
-        after = oldest
-
-    rows = _dedupe_rows(rows)
-    if not rows:
-        raise NoChartData(f"No chart data found for `{request.ticker}`.")
-    return rows
-
-
-async def _fetch_binance_24h_ticker(
-    session: aiohttp.ClientSession,
-    request: ChartRequest,
-    market: str,
-) -> tuple[float, float, int] | None:
-    symbol = BINANCE_CRYPTO_SYMBOLS[request.ticker][0]
-    base_url = BINANCE_FUTURES_BASE_URL if market == "perp" else BINANCE_SPOT_BASE_URL
-    path = "/fapi/v1/ticker/24hr" if market == "perp" else "/api/v3/ticker/24hr"
-    data = await _request_json(session, f"{base_url}{path}", params={"symbol": symbol})
-    if not isinstance(data, dict):
-        return None
-    last = safe_float(data.get("lastPrice"))
-    open_ = safe_float(data.get("openPrice"))
-    close_time = safe_float(data.get("closeTime"))
-    if last is None or open_ is None:
-        return None
-    return last, open_, int((close_time or time.time() * 1000) // 1000)
-
-
-async def _fetch_okx_24h_ticker(
-    session: aiohttp.ClientSession,
-    request: ChartRequest,
-) -> tuple[float, float, int] | None:
-    symbol = BINANCE_CRYPTO_SYMBOLS[request.ticker][0].replace("USDT", "-USDT-SWAP")
-    data = await _request_json(
-        session,
-        f"{OKX_BASE_URL}/api/v5/market/ticker",
-        params={"instId": symbol},
-    )
-    if not isinstance(data, dict) or data.get("code") != "0":
-        return None
-    rows = data.get("data") or []
-    if not rows or not isinstance(rows[0], dict):
-        return None
-    last = safe_float(rows[0].get("last"))
-    open_ = safe_float(rows[0].get("open24h"))
-    timestamp = safe_float(rows[0].get("ts"))
-    if last is None or open_ is None:
-        return None
-    return last, open_, int((timestamp or time.time() * 1000) // 1000)
-
-
-async def _optional_ticker(
-    task: asyncio.Task[tuple[float, float, int] | None],
-) -> tuple[float, float, int] | None:
-    try:
-        return await task
-    except aiohttp.ClientError, TimeoutError, MarketDataProviderError, JSONDecodeError:
-        return None
-
-
-def _binance_quote_from_klines(
-    rows: list[list[Any]],
-    request: ChartRequest,
-    market: str,
-    source_label: str,
-    display_market: str,
-    ticker_24h: tuple[float, float, int] | None,
-) -> ChartData:
-    dates: list[int] = []
-    opens: list[float] = []
-    highs: list[float] = []
-    lows: list[float] = []
-    closes: list[float] = []
-    volumes: list[float] = []
-    close_times: list[int] = []
-    for row in rows:
-        open_time = safe_float(row[0])
-        close_time = safe_float(row[6]) if len(row) > 6 else None
-        open_ = safe_float(row[1])
-        high = safe_float(row[2])
-        low = safe_float(row[3])
-        close = safe_float(row[4])
-        volume = safe_float(row[5])
-        if (
-            open_time is None
-            or open_ is None
-            or high is None
-            or low is None
-            or close is None
-        ):
-            continue
-        dates.append(int(open_time // 1000))
-        opens.append(open_ or 0.0)
-        highs.append(high or 0.0)
-        lows.append(low or 0.0)
-        closes.append(close or 0.0)
-        volumes.append(volume or 0.0)
-        close_times.append(int((close_time or open_time) // 1000))
-
-    if len(closes) < 2:
-        raise NoChartData(f"Too little chart data found for `{request.ticker}`.")
-
-    now = int(time.time())
-    last, previous, last_time = ticker_24h or (
-        closes[-1],
-        None,
-        min(close_times[-1], now),
-    )
-    change = last - previous if previous is not None else None
-    symbol, display_name = BINANCE_CRYPTO_SYMBOLS[request.ticker]
-    interval = _binance_interval(request)
-    return ChartData(
-        ticker=request.ticker,
-        name=f"{display_name} {display_market} ({symbol}, {source_label})",
-        rows=normalize_chart_rows(
-            dates, opens, highs, lows, closes, volumes, last_close=last
-        ),
-        last_close=last,
-        last_time=last_time,
-        previous_close=previous,
-        change=change,
-        change_percent=(change / previous * 100)
-        if change is not None and previous
-        else None,
-        market_label=f"{source_label} {display_market}",
-        source_interval_seconds=_source_interval_seconds(interval),
-    )
-
-
-def _okx_quote_from_klines(
-    rows: list[list[Any]],
-    request: ChartRequest,
-    ticker_24h: tuple[float, float, int] | None,
-) -> ChartData:
-    ordered_rows = sorted(rows, key=lambda row: int(row[0]))
-    dates: list[int] = []
-    opens: list[float] = []
-    highs: list[float] = []
-    lows: list[float] = []
-    closes: list[float] = []
-    volumes: list[float] = []
-    for row in ordered_rows:
-        open_time = safe_float(row[0])
-        open_ = safe_float(row[1])
-        high = safe_float(row[2])
-        low = safe_float(row[3])
-        close = safe_float(row[4])
-        base_volume = safe_float(row[6])
-        if (
-            open_time is None
-            or open_ is None
-            or high is None
-            or low is None
-            or close is None
-        ):
-            continue
-        dates.append(int(open_time // 1000))
-        opens.append(open_)
-        highs.append(high)
-        lows.append(low)
-        closes.append(close)
-        volumes.append(base_volume or 0.0)
-
-    if len(closes) < 2:
-        raise NoChartData(f"Too little chart data found for `{request.ticker}`.")
-
-    last, previous, last_time = ticker_24h or (
-        closes[-1],
-        None,
-        min(dates[-1], int(time.time())),
-    )
-    change = last - previous if previous is not None else None
-    _, display_name = BINANCE_CRYPTO_SYMBOLS[request.ticker]
-    inst_id = BINANCE_CRYPTO_SYMBOLS[request.ticker][0].replace("USDT", "-USDT-SWAP")
-    return ChartData(
-        ticker=request.ticker,
-        name=f"{display_name} perpetual ({inst_id}, OKX)",
-        rows=normalize_chart_rows(
-            dates, opens, highs, lows, closes, volumes, last_close=last
-        ),
-        last_close=last,
-        last_time=last_time,
-        previous_close=previous,
-        change=change,
-        change_percent=(change / previous * 100)
-        if change is not None and previous
-        else None,
-        market_label="OKX perp",
-        source_interval_seconds=_source_interval_seconds(_okx_interval(request)),
-    )
-
-
-async def fetch_crypto_chart_data(
-    session: aiohttp.ClientSession, request: ChartRequest
-) -> ChartData:
-    market = _crypto_auto_market(request)
-    if market == "perp":
-        okx_ticker_task = asyncio.create_task(_fetch_okx_24h_ticker(session, request))
-        try:
-            rows = await _fetch_okx_swap_klines(session, request)
-        except (
-            aiohttp.ClientError,
-            TimeoutError,
-            JSONDecodeError,
-            MarketDataProviderError,
-        ):
-            okx_ticker_task.cancel()
-            await asyncio.gather(okx_ticker_task, return_exceptions=True)
-            LOGGER.info("provider_fallback source=okx target=binance market=perp")
-        else:
-            ticker_24h = await _optional_ticker(okx_ticker_task)
-            return aggregate_chart_data(
-                _okx_quote_from_klines(rows, request, ticker_24h), request
-            )
-
-    binance_ticker_task = asyncio.create_task(
-        _fetch_binance_24h_ticker(session, request, market)
-    )
-    try:
-        rows = await _fetch_binance_klines(session, request, market)
-    except BaseException:
-        binance_ticker_task.cancel()
-        await asyncio.gather(binance_ticker_task, return_exceptions=True)
-        raise
-    ticker_24h = await _optional_ticker(binance_ticker_task)
-    data = _binance_quote_from_klines(
-        rows,
-        request,
-        market,
-        "Binance",
-        "perp" if market == "perp" else "spot",
-        ticker_24h,
-    )
-    return aggregate_chart_data(data, request)
-
-
-def _tradingview_message(method: str, params: list[Any]) -> str:
-    payload = json.dumps({"m": method, "p": params}, separators=(",", ":"))
-    return f"~m~{len(payload)}~m~{payload}"
-
-
-async def fetch_tradingview_intraday_chart_data(
-    session: aiohttp.ClientSession,
-    request: ChartRequest,
-) -> ChartData:
-    symbol = (
-        TRADINGVIEW_FUTURES_SYMBOLS.get(request.ticker)
-        if request.futures
-        else request.ticker.replace("-", ".")
-    )
-    interval = TRADINGVIEW_INTERVALS.get(request.timeframe)
-    interval_seconds = TRADINGVIEW_INTERVAL_SECONDS.get(request.timeframe)
-    if symbol is None or interval is None or interval_seconds is None:
-        raise NoChartData(
-            f"No accurate intraday data found for `{request.ticker}`."
-        )
-
-    chart_session = f"cs_{secrets.token_hex(6)}"
-    series_rows: dict[str, dict[int, ChartRow]] = {"s1": {}, "d1": {}}
-    expected_series = set(series_rows)
-    completed_series: set[str] = set()
-    daily_series_requested = False
-    resolved_name = request.ticker
-    symbol_spec = "=" + json.dumps(
-        {"symbol": symbol, "adjustment": "splits", "session": "regular" if request.futures else "24h"},
-        separators=(",", ":"),
-    )
-    daily_symbol_spec = "=" + json.dumps(
-        {"symbol": symbol, "adjustment": "splits", "session": "regular"},
-        separators=(",", ":"),
-    )
-
-    async with session.ws_connect(
-        TRADINGVIEW_WS_URL,
-        origin="https://www.tradingview.com",
-        heartbeat=20,
-    ) as websocket:
-        commands = (
-            ("set_auth_token", ["unauthorized_user_token"]),
-            ("chart_create_session", [chart_session, ""]),
-            ("switch_timezone", [chart_session, "Etc/UTC"]),
-            ("resolve_symbol", [chart_session, "symbol_1", symbol_spec]),
-            (
-                "create_series",
-                [
-                    chart_session,
-                    "s1",
-                    "s1",
-                    "symbol_1",
-                    interval,
-                    TRADINGVIEW_HISTORY_BARS,
-                    "",
-                ],
-            ),
-        )
-        for method, params in commands:
-            await websocket.send_str(_tradingview_message(method, params))
-
-        async with asyncio.timeout(10):
-            async for message in websocket:
-                if message.type == aiohttp.WSMsgType.TEXT:
-                    parts = message.data.split("~m~")
-                    for index in range(2, len(parts), 2):
-                        raw_payload = parts[index]
-                        if raw_payload.startswith("~h~"):
-                            await websocket.send_str(
-                                f"~m~{len(raw_payload)}~m~{raw_payload}"
-                            )
-                            continue
-                        try:
-                            payload = json.loads(raw_payload)
-                        except JSONDecodeError as error:
-                            raise MarketDataProviderError(
-                                "Market data provider returned malformed data"
-                            ) from error
-                        if not isinstance(payload, dict):
-                            continue
-                        method = payload.get("m")
-                        params = payload.get("p") or []
-                        if (
-                            method == "symbol_resolved"
-                            and len(params) > 2
-                            and isinstance(params[2], dict)
-                        ):
-                            resolved_name = str(
-                                params[2].get("description")
-                                or params[2].get("short_description")
-                                or request.ticker
-                            )
-                        if method == "symbol_error":
-                            raise NoChartData(
-                                f"No chart data found for `{request.ticker}`."
-                            )
-                        if method in {"critical_error", "protocol_error"}:
-                            raise MarketDataProviderError(
-                                "Market data provider returned an error"
-                            )
-                        if (
-                            method == "timescale_update"
-                            and len(params) > 1
-                            and isinstance(params[1], dict)
-                        ):
-                            for series_id, rows_by_epoch in series_rows.items():
-                                series = params[1].get(series_id)
-                                if not isinstance(series, dict):
-                                    continue
-                                for raw_bar in series.get("s") or []:
-                                    values = (
-                                        raw_bar.get("v")
-                                        if isinstance(raw_bar, dict)
-                                        else None
-                                    )
-                                    if not isinstance(values, list) or len(values) < 6:
-                                        continue
-                                    epoch, open_, high, low, close, volume = (
-                                        safe_float(value) for value in values[:6]
-                                    )
-                                    if (
-                                        epoch is None
-                                        or open_ is None
-                                        or high is None
-                                        or low is None
-                                        or close is None
-                                        or high < low
-                                    ):
-                                        continue
-                                    timestamp = int(epoch)
-                                    rows_by_epoch[timestamp] = ChartRow(
-                                        timestamp,
-                                        open_,
-                                        high,
-                                        low,
-                                        close,
-                                        volume or 0.0,
-                                    )
-                        elif method == "series_completed" and len(params) > 1:
-                            series_id = str(params[1])
-                            if series_id in expected_series:
-                                completed_series.add(series_id)
-                            if series_id == "s1" and not daily_series_requested:
-                                await websocket.send_str(
-                                    _tradingview_message(
-                                        "remove_series",
-                                        [chart_session, "s1"],
-                                    )
-                                )
-                                daily_symbol = "symbol_1"
-                                if not request.futures:
-                                    daily_symbol = "symbol_daily"
-                                    await websocket.send_str(
-                                        _tradingview_message(
-                                            "resolve_symbol",
-                                            [chart_session, daily_symbol, daily_symbol_spec],
-                                        )
-                                    )
-                                await websocket.send_str(
-                                    _tradingview_message(
-                                        "create_series",
-                                        [
-                                            chart_session,
-                                            "d1",
-                                            "d1",
-                                            daily_symbol,
-                                            "1D",
-                                            3,
-                                            "",
-                                        ],
-                                    )
-                                )
-                                daily_series_requested = True
-                    if completed_series == expected_series:
-                        break
-                elif message.type in {
-                    aiohttp.WSMsgType.CLOSE,
-                    aiohttp.WSMsgType.CLOSED,
-                    aiohttp.WSMsgType.CLOSING,
-                    aiohttp.WSMsgType.ERROR,
-                }:
-                    break
-
-    if completed_series != expected_series:
-        raise MarketDataProviderError(
-            "Market data provider ended the chart response early"
-        )
-
-    rows = tuple(series_rows["s1"][epoch] for epoch in sorted(series_rows["s1"]))
-    daily_rows = tuple(series_rows["d1"][epoch] for epoch in sorted(series_rows["d1"]))
-    if len(rows) < 2:
-        raise NoChartData(f"Too little chart data found for `{request.ticker}`.")
-
-    last = rows[-1].close
-    if request.futures:
-        previous = daily_rows[-2].close if len(daily_rows) > 1 else None
-    else:
-        last_local_time = dt.datetime.fromtimestamp(
-            rows[-1].epoch,
-            dt.timezone.utc,
-        ).astimezone(MARKET_TIME_ZONE).time()
-        during_regular_session = REGULAR_SESSION_START <= last_local_time < REGULAR_SESSION_END
-        previous = (
-            daily_rows[-2].close
-            if during_regular_session and len(daily_rows) > 1
-            else daily_rows[-1].close if daily_rows else None
-        )
-    change = last - previous if previous is not None else None
-    return ChartData(
-        ticker=request.ticker,
-        name=resolved_name,
-        rows=rows,
-        last_close=last,
-        last_time=rows[-1].epoch,
-        previous_close=previous,
-        change=change,
-        change_percent=(change / previous * 100)
-        if change is not None and previous
-        else None,
-        market_label="TradingView delayed" if request.futures else "TradingView 24h",
-        futures=request.futures,
-        source_interval_seconds=interval_seconds,
-    )
-
-
-async def fetch_webull_intraday_chart_data(
-    session: aiohttp.ClientSession, request: ChartRequest
-) -> ChartData:
-    """Real-time stock intraday charts from Webull's anonymous gateways.
-
-    Native interval klines (extended hours included), with 2m/3m aggregated
-    from 1m, and the forming bar patched from the MQTT tick stream when live
-    or from the real-time REST snapshot.
-    """
-    bucket_seconds = WEBULL_STOCK_INTERVAL_SECONDS[request.timeframe]
-    resolution = await resolve_ticker(session, request.ticker)
-    if resolution is None and "-" in request.ticker:
-        resolution = await resolve_ticker(session, request.ticker.replace("-", "."))
-    if resolution is None:
-        raise NoChartData(f"No chart data found for `{request.ticker}`.")
-
-    streamer = client.webull_streamer
-    if streamer is not None:
-        # Subscribe before the REST work so the first request can use a push
-        # received while history and snapshot calls are in flight.
-        streamer.subscribe(resolution.ticker_id)
-
-    bars_task = asyncio.create_task(
-        fetch_intraday_bars(session, resolution.ticker_id, request.timeframe)
-    )
-    quote_task = asyncio.create_task(fetch_realtime_quote(session, resolution.ticker_id))
-    try:
-        history_rows, history_pre_close = await bars_task
-    except BaseException:
-        quote_task.cancel()
-        await asyncio.gather(quote_task, return_exceptions=True)
-        raise
-    last: float | None = None
-    previous: float | None = None
-    last_time: int | None = None
-    session_flag = ""
-    try:
-        raw_quote = await quote_task
-        last, previous, last_time, session_flag = snapshot_quote(raw_quote)
-    except WebullProviderError:
-        pass
-    if previous is None:
-        previous = history_pre_close
-    live: LiveQuote | None = streamer.latest(resolution.ticker_id) if streamer else None
-    if live is not None and (last_time is None or live.pub_ms // 1000 >= last_time):
-        last = live.price
-        last_time = int(live.pub_ms // 1000)
-        session_flag = live.session or session_flag
-
-    rows = (
-        bucket_rows(history_rows, bucket_seconds)
-        if request.timeframe in {"i2", "i3"}
-        else list(history_rows)
-    )
-    if last is not None:
-        rows = patch_live_bar(
-            rows,
-            LiveQuote(last, (last_time or int(time.time())) * 1000, session_flag),
-            bucket_seconds,
-        )
-    if len(rows) < 2:
-        raise NoChartData(f"Too little chart data found for `{request.ticker}`.")
-
-    last_close = last if last is not None else rows[-1][4]
-    last_time = last_time if last_time is not None else rows[-1][0]
-    change = (last_close - previous) if previous else None
-    return ChartData(
-        ticker=request.ticker,
-        name=resolution.name,
-        rows=tuple(ChartRow(*row) for row in rows),
-        last_close=last_close,
-        last_time=last_time,
-        previous_close=previous,
-        change=change,
-        change_percent=(change / previous * 100)
-        if change is not None and previous
-        else None,
-        market_label="Webull real-time",
-        source_interval_seconds=bucket_seconds,
-        preserve_last_bar=True,
-    )
-
-
-async def fetch_market_chart_data(
-    session: aiohttp.ClientSession, request: ChartRequest
-) -> ChartData:
-    if request.crypto_market:
-        return await fetch_crypto_chart_data(session, request)
-    if (
-        not request.futures
-        and request.timeframe in WEBULL_STOCK_INTERVAL_SECONDS
-        and request.ticker not in YAHOO_SYMBOL_ALIASES
-    ):
-        try:
-            return await fetch_webull_intraday_chart_data(session, request)
-        except (
-            aiohttp.ClientError,
-            TimeoutError,
-            JSONDecodeError,
-            NoChartData,
-            WebullProviderError,
-        ) as error:
-            LOGGER.info(
-                "provider_fallback source=webull target=tradingview ticker=%s error_type=%s",
-                request.ticker,
-                type(error).__name__,
-            )
-    if (
-        request.timeframe in TRADINGVIEW_INTERVALS
-        and (
-            (request.futures and request.ticker in TRADINGVIEW_FUTURES_SYMBOLS)
-            or (not request.futures and request.ticker not in YAHOO_SYMBOL_ALIASES)
-        )
-    ):
-        return await fetch_tradingview_intraday_chart_data(session, request)
-
-    daily_reference_task = (
-        asyncio.create_task(fetch_daily_previous_close(session, request))
-        if request.futures and request.timeframe != "d"
-        else None
-    )
-    try:
-        result = _chart_result(
-            await _request_json(session, yahoo_chart_url(request)), request.ticker
-        )
-    except BaseException as error:
-        if daily_reference_task is not None:
-            daily_reference_task.cancel()
-            await asyncio.gather(daily_reference_task, return_exceptions=True)
-        if isinstance(error, MarketDataHTTPError) and error.status == 404:
-            raise NoChartData(f"No chart data found for `{request.ticker}`.") from error
-        raise
-    meta = result.get("meta") or {}
-    raw_quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
-    dates = result.get("timestamp") or []
-    closes = raw_quote.get("close") or []
-    last, last_time = latest_quote_price_time(meta, dates, closes, request)
-    prev = stock_previous_close(meta, closes, request)
-    if daily_reference_task is not None:
-        daily_prev = await daily_reference_task
-        if daily_prev is not None:
-            prev = daily_prev
-    elif not request.futures and request.timeframe != "d" and prev is None:
-        prev = await fetch_daily_previous_close(session, request)
-    change = (last - prev) if last is not None and prev else None
-    raw_data = {
-        "ticker": request.ticker,
-        "futures": request.futures,
-        "name": meta.get("shortName") or meta.get("longName") or request.ticker,
-        "date": dates,
-        "open": raw_quote.get("open") or [],
-        "high": raw_quote.get("high") or [],
-        "low": raw_quote.get("low") or [],
-        "close": closes,
-        "volume": raw_quote.get("volume") or [],
-        "lastClose": last,
-        "lastTime": last_time,
-        "prevClose": prev,
-        "perfDayUsd": change,
-    }
-    if (
-        request.timeframe == "d"
-        and not request.futures
-        and has_close_only_latest_ohlc(raw_data)
-    ):
-        intraday_quote = await fetch_current_day_intraday_quote(session, request)
-        if intraday_quote is not None:
-            raw_data = patch_close_only_latest_ohlc(raw_data, intraday_quote)
-
-    interval = str(meta.get("dataGranularity") or "")
-    chart_data = ChartData(
-        ticker=request.ticker,
-        name=str(meta.get("shortName") or meta.get("longName") or request.ticker),
-        rows=normalize_chart_rows(
-            raw_data["date"],
-            raw_data["open"],
-            raw_data["high"],
-            raw_data["low"],
-            raw_data["close"],
-            raw_data["volume"],
-            last_close=last,
-        ),
-        last_close=last,
-        last_time=last_time,
-        previous_close=prev,
-        change=change,
-        change_percent=(change / prev * 100) if change is not None and prev else None,
-        futures=request.futures,
-        source_interval_seconds=_source_interval_seconds(interval),
-    )
-    return aggregate_chart_data(chart_data, request)
-
-
-async def send_chart(channel: discord.abc.Messageable, request: ChartRequest) -> None:
-    session = client.session
-    if session is None:
-        await channel.send(
-            "Market data is temporarily unavailable. Try again in a minute.",
-            allowed_mentions=NO_MENTIONS,
-        )
-        return
-    started = time.perf_counter()
-    async with channel.typing():
-        try:
-            async with asyncio.timeout(MARKET_DATA_BUDGET_SECONDS):
-                async with FETCH_SEMAPHORE:
-                    data = await fetch_market_chart_data(session, request)
                 fetched = time.perf_counter()
-                async with RENDER_SEMAPHORE:
-                    image = await asyncio.to_thread(
-                        render_price_chart_png, data, request
-                    )
+                image = await asyncio.get_running_loop().run_in_executor(
+                    self.render_pool, render_price_chart_png, data, request
+                )
                 rendered = time.perf_counter()
-        except NoChartData as error:
-            LOGGER.info("chart outcome=no_data")
-            await channel.send(str(error), allowed_mentions=NO_MENTIONS)
-            return
-        except (
-            aiohttp.ClientError,
-            TimeoutError,
-            JSONDecodeError,
-            MarketDataProviderError,
-        ) as error:
-            LOGGER.warning(
-                "chart outcome=provider_error error_type=%s", type(error).__name__
-            )
-            await channel.send(
-                "Market data is temporarily unavailable. Try again in a minute.",
-                allowed_mentions=NO_MENTIONS,
-            )
-            return
+            except NoChartData as error:
+                LOGGER.info("chart outcome=no_data ticker=%s", request.ticker)
+                await channel.send(str(error))
+                return
+            except PROVIDER_ERRORS as error:
+                LOGGER.warning(
+                    "chart outcome=provider_error ticker=%s error_type=%s",
+                    request.ticker,
+                    type(error).__name__,
+                )
+                await channel.send(UNAVAILABLE_MESSAGE)
+                return
 
-    LOGGER.info(
-        "chart outcome=success provider=%s fetch_ms=%d render_ms=%d total_ms=%d",
-        data.market_label or "yahoo",
-        round((fetched - started) * 1000),
-        round((rendered - fetched) * 1000),
-        round((rendered - started) * 1000),
-    )
-
-    filename = f"{request.ticker}_{request.timeframe}_{int(time.time())}.png"
-    file = discord.File(io.BytesIO(image), filename=filename)
-    embed = discord.Embed(
-        title=chart_title(request, data.market_label or None),
-        description=quote_description(data),
-        color=0x2ECC71 if (data.change or 0.0) >= 0 else 0xFF5252,
-    )
-    embed.set_image(url=f"attachment://{filename}")
-    try:
-        await channel.send(embed=embed, file=file, allowed_mentions=NO_MENTIONS)
-    except discord.HTTPException:
-        await channel.send(
-            "Chart rendered, but Discord rejected the image upload.",
-            allowed_mentions=NO_MENTIONS,
+        LOGGER.info(
+            "chart outcome=success ticker=%s provider=%s fetch_ms=%d render_ms=%d total_ms=%d",
+            request.ticker,
+            data.market_label or "yahoo",
+            round((fetched - started) * 1000),
+            round((rendered - fetched) * 1000),
+            round((rendered - started) * 1000),
         )
+        filename = f"{request.ticker}_{request.timeframe}_{int(time.time())}.png"
+        embed = discord.Embed(
+            title=chart_title(request, data.market_label or None),
+            description=quote_description(data),
+            color=0x2ECC71 if (data.change or 0.0) >= 0 else 0xFF5252,
+        )
+        embed.set_image(url=f"attachment://{filename}")
+        try:
+            await channel.send(embed=embed, file=discord.File(io.BytesIO(image), filename=filename))
+        except discord.HTTPException:
+            LOGGER.warning("chart outcome=upload_rejected ticker=%s", request.ticker)
+            await channel.send("Chart rendered, but Discord rejected the image upload.")
 
 
 def main() -> None:
@@ -1283,9 +194,8 @@ def main() -> None:
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise SystemExit("Missing DISCORD_TOKEN. Put it in .env or export it.")
-    handler = logging.StreamHandler(sys.stdout)
-    logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
-    client.run(token, log_handler=None)
+    logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler(sys.stdout)], force=True)
+    ChartBot().run(token, log_handler=None)
 
 
 if __name__ == "__main__":
