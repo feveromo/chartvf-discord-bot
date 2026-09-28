@@ -85,6 +85,12 @@ HISTORY_MAX_PAGES = 6
 HISTORY_TARGET_BARS = 350
 STREAM_STALE_MS = 10_000
 MAX_STREAM_SUBSCRIPTIONS = 50
+# The push gateway closes a socket 60 s after the last client hello, however
+# many MQTT pings it answers, so the hello doubles as an app-level heartbeat.
+STREAM_HELLO_SECONDS = 20
+# Tickers nobody has charted for this long are unsubscribed; with none left
+# the socket closes until the next stock intraday chart.
+STREAM_IDLE_SECONDS = 15 * 60
 
 Bar = tuple[int, float, float, float, float, float]  # epoch, open, high, low, close, volume
 
@@ -413,23 +419,26 @@ def decode_quote_payload(payload: bytes) -> tuple[float, int, str] | None:
 
 
 class WebullStreamer:
-    """Background MQTT quote stream. Anonymous: random credentials, random did.
+    """On-demand MQTT quote stream. Anonymous: random credentials, random did.
 
-    paho runs its own network thread; a small lock protects quote and
-    subscription state shared with the asyncio side.
+    The socket opens with the first subscription and closes once every
+    subscribed ticker has gone STREAM_IDLE_SECONDS without a chart request.
+    paho runs its own network thread and a heartbeat thread re-sends the hello;
+    a small lock protects the client, quote and subscription state shared with
+    the asyncio side.
     """
 
     def __init__(self) -> None:
         self._client: mqtt.Client | None = None
+        self._stopped = threading.Event()
         self._did = uuid.uuid4().hex
-        self._subscriptions: dict[int, None] = {}  # insertion order = LRU order
+        # tickerId -> monotonic time of the last chart request; insertion order = LRU order
+        self._subscriptions: dict[int, float] = {}
         self._latest: dict[int, LiveQuote] = {}
         self._lock = threading.Lock()
         self.connected = False
 
-    def start(self) -> None:
-        if self._client is not None:
-            return
+    def _start_locked(self) -> mqtt.Client:
         client = mqtt.Client(
             CallbackAPIVersion.VERSION2,
             client_id=self._did,
@@ -443,40 +452,60 @@ class WebullStreamer:
         client.on_disconnect = self._on_disconnect
         client.on_connect_fail = self._on_connect_fail
         client.reconnect_delay_set(min_delay=1, max_delay=30)
+        # Callbacks ignore clients other than self._client, so publish it first.
+        self._client = client
+        self._stopped = threading.Event()
         # connect_async + loop_start never blocks the event loop, and paho's
-        # thread keeps retrying (with the backoff above) until the first
-        # connection succeeds instead of giving up for the process lifetime.
+        # thread keeps retrying (with the backoff above) until it connects.
         client.connect_async(MQTT_HOST, 443, keepalive=25)
         client.loop_start()
-        self._client = client
+        threading.Thread(
+            target=self._heartbeat,
+            args=(client, self._stopped),
+            name="webull-heartbeat",
+            daemon=True,
+        ).start()
         LOGGER.info("webull streamer started")
+        return client
 
-    def stop(self) -> None:
+    def _detach_locked(self) -> mqtt.Client | None:
         client = self._client
         self._client = None
+        self._stopped.set()
+        self.connected = False
+        return client
+
+    @staticmethod
+    def _shutdown(client: mqtt.Client | None) -> None:
         if client is not None:
             client.disconnect()
             client.loop_stop()
-        self.connected = False
+
+    def stop(self) -> None:
+        with self._lock:
+            client = self._detach_locked()
+        self._shutdown(client)
 
     def subscribe(self, ticker_id: int) -> None:
         evicted: list[int] = []
         with self._lock:
-            if ticker_id in self._subscriptions:
-                self._subscriptions.pop(ticker_id)
-                self._subscriptions[ticker_id] = None
-                return
-            self._subscriptions[ticker_id] = None
+            known = self._subscriptions.pop(ticker_id, None) is not None
+            self._subscriptions[ticker_id] = time.monotonic()
             while len(self._subscriptions) > MAX_STREAM_SUBSCRIPTIONS:
                 oldest = next(iter(self._subscriptions))
                 self._subscriptions.pop(oldest)
                 self._latest.pop(oldest, None)
                 evicted.append(oldest)
-        client = self._client
-        if client is not None and self.connected:
+            client = self._client
+            if client is None:
+                # _on_connect subscribes everything pending.
+                self._start_locked()
+                return
+        if self.connected:
             for evicted_id in evicted:
                 client.unsubscribe(_subscription_topic(evicted_id))
-            client.subscribe(_subscription_topic(ticker_id))
+            if not known:
+                client.subscribe(_subscription_topic(ticker_id))
 
     def latest(self, ticker_id: int) -> LiveQuote | None:
         with self._lock:
@@ -488,12 +517,34 @@ class WebullStreamer:
                 return None
             return quote
 
-    def _on_connect(self, client: mqtt.Client, _userdata: Any, _flags: Any, rc: Any, _properties: Any = None) -> None:
-        if rc.is_failure:
-            self.connected = False
-            LOGGER.warning("webull streamer connection rejected rc=%s", rc)
-            return
-        self.connected = True
+    def _heartbeat(self, client: mqtt.Client, stopped: threading.Event) -> None:
+        while not stopped.wait(STREAM_HELLO_SECONDS) and self._beat(client):
+            pass
+
+    def _beat(self, client: mqtt.Client) -> bool:
+        """Drop idle tickers and re-send the hello. False once ``client`` is done."""
+        cutoff = time.monotonic() - STREAM_IDLE_SECONDS
+        with self._lock:
+            if client is not self._client:
+                return False
+            expired = [tid for tid, seen in self._subscriptions.items() if seen < cutoff]
+            for ticker_id in expired:
+                del self._subscriptions[ticker_id]
+                self._latest.pop(ticker_id, None)
+            idle = not self._subscriptions
+            if idle:
+                self._detach_locked()
+        if idle:
+            self._shutdown(client)
+            LOGGER.info("webull streamer idle; disconnected")
+            return False
+        if self.connected:
+            for ticker_id in expired:
+                client.unsubscribe(_subscription_topic(ticker_id))
+            self._send_hello(client)
+        return True
+
+    def _send_hello(self, client: mqtt.Client) -> None:
         hello = {
             "header": {
                 "did": self._did,
@@ -505,6 +556,16 @@ class WebullStreamer:
             }
         }
         client.subscribe(json.dumps(hello))
+
+    def _on_connect(self, client: mqtt.Client, _userdata: Any, _flags: Any, rc: Any, _properties: Any = None) -> None:
+        if client is not self._client:
+            return
+        if rc.is_failure:
+            self.connected = False
+            LOGGER.warning("webull streamer connection rejected rc=%s", rc)
+            return
+        self.connected = True
+        self._send_hello(client)
         with self._lock:
             pending = sorted(self._subscriptions)
         for ticker_id in pending:
@@ -514,7 +575,9 @@ class WebullStreamer:
     def _on_connect_fail(self, _client: mqtt.Client, _userdata: Any) -> None:
         LOGGER.warning("webull streamer connect failed; retrying")
 
-    def _on_disconnect(self, _client: mqtt.Client, _userdata: Any, _flags: Any, rc: Any, _properties: Any = None) -> None:
+    def _on_disconnect(self, client: mqtt.Client, _userdata: Any, _flags: Any, rc: Any, _properties: Any = None) -> None:
+        if client is not self._client:
+            return
         self.connected = False
         if rc.is_failure:
             LOGGER.info("webull streamer disconnected rc=%s", rc)
