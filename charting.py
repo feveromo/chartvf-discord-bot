@@ -2,20 +2,19 @@ import datetime as dt
 import io
 import math
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from itertools import pairwise
 from typing import Any, Literal, NamedTuple
-from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
 
 PREFIX = ";"
+HELP_COMMANDS = frozenset({"help", "h"})
 DEFAULT_TIMEFRAME = "d"
-DEFAULT_STOCK_TIMEFRAME = "i5"
-DEFAULT_STOCK_TIMEFRAME_LABEL = "5 min"
+DEFAULT_INTRADAY_TIMEFRAME = "i5"
 DEFAULT_CHART_TYPE = "c"
 DEFAULT_THEME = "light"
 DEFAULT_SCALE = "linear"
@@ -30,6 +29,11 @@ STOCK_INTRADAY_VISIBLE_BARS = 150
 STOCK_MONTHLY_VISIBLE_BARS = 240
 SMA_PERIODS = (20, 50, 200)
 SMA_COLORS = {20: (142, 43, 132), 50: (238, 126, 35), 200: (139, 111, 43)}
+# SMA lines are drawn on a 4x supersampled mask and box-filtered down, which
+# gives exact coverage anti-aliasing without blurring the line.
+SMA_SUPERSAMPLE = 4
+SMA_LINE_WIDTH = 1.25
+SMA_MASK_MARGIN = 2
 LIGHT_DAILY_UP = (21, 141, 54)
 LIGHT_DAILY_DOWN = (213, 33, 45)
 LIGHT_DAILY_VOLUME_ALPHA = 0.28
@@ -40,36 +44,56 @@ DARK_LINE_COLOR = (55, 160, 245)
 DARK_VOLUME_UP = (25, 120, 75)
 DARK_VOLUME_DOWN = (128, 58, 68)
 FUTURES_INTRADAY_VISIBLE_BARS = 120
-STOCK_5M_START = dt.time(4, 0)
-STOCK_5M_END = dt.time(20, 0)
+EXTENDED_SESSION_START = dt.time(4, 0)
 REGULAR_SESSION_START = dt.time(9, 30)
 REGULAR_SESSION_END = dt.time(16, 0)
+EXTENDED_SESSION_END = dt.time(20, 0)
 EXTENDED_WICK_PCT_LIMIT = 0.004
 EXTENDED_WICK_RANGE_MULTIPLE = 3.0
 FUTURES_STALE_WICK_RANGE_MULTIPLE = 2.0
 FUTURES_STALE_EXTREME_MIN_REPEATS = 3
 FUTURES_STALE_EXTREME_MIN_FLAGS = 2
 SPARSE_CHART_MIN_BARS = 24
+DAY = 86400
+WEEK = 7 * DAY
+
+
+class Timeframe(NamedTuple):
+    label: str
+    seconds: int
+    stocks: bool = True  # False: crypto and futures only
+
 
 TIMEFRAMES = {
-    "d": ("d", "daily"),
-    "daily": ("d", "daily"),
-    "w": ("w", "weekly"),
-    "weekly": ("w", "weekly"),
-    "m": ("m", "monthly"),
-    "monthly": ("m", "monthly"),
+    "d": Timeframe("daily", DAY),
+    "w": Timeframe("weekly", WEEK),
+    "m": Timeframe("monthly", 30 * DAY),
+    "i1": Timeframe("1 min", 60),
+    "i2": Timeframe("2 min", 2 * 60),
+    "i3": Timeframe("3 min", 3 * 60),
+    "i5": Timeframe("5 min", 5 * 60),
+    "i10": Timeframe("10 min", 10 * 60, stocks=False),
+    "i15": Timeframe("15 min", 15 * 60),
+    "i30": Timeframe("30 min", 30 * 60),
+    "h": Timeframe("hourly", 60 * 60),
+    "h2": Timeframe("2 hour", 2 * 60 * 60, stocks=False),
+    "h4": Timeframe("4 hour", 4 * 60 * 60),
 }
-FUTURES_TIMEFRAMES = {
-    "1": ("i1", "1 min"), "i1": ("i1", "1 min"), "1min": ("i1", "1 min"),
-    "2": ("i2", "2 min"), "i2": ("i2", "2 min"), "2min": ("i2", "2 min"),
-    "3": ("i3", "3 min"), "i3": ("i3", "3 min"), "3min": ("i3", "3 min"),
-    "5": ("i5", "5 min"), "i5": ("i5", "5 min"), "5min": ("i5", "5 min"),
-    "10": ("i10", "10 min"), "i10": ("i10", "10 min"), "10min": ("i10", "10 min"),
-    "15": ("i15", "15 min"), "i15": ("i15", "15 min"), "15min": ("i15", "15 min"),
-    "30": ("i30", "30 min"), "i30": ("i30", "30 min"), "30min": ("i30", "30 min"),
-    "60": ("h", "hourly"), "h": ("h", "hourly"), "1h": ("h", "hourly"), "hourly": ("h", "hourly"),
-    "2h": ("h2", "2 hour"), "h2": ("h2", "2 hour"),
-    "4h": ("h4", "4 hour"), "h4": ("h4", "4 hour"),
+TIMEFRAME_ALIASES = {
+    **{code: code for code in TIMEFRAMES},
+    **{
+        alias: f"i{minutes}"
+        for minutes in (1, 2, 3, 5, 10, 15, 30)
+        for alias in (str(minutes), f"{minutes}min")
+    },
+    "daily": "d",
+    "weekly": "w",
+    "monthly": "m",
+    "60": "h",
+    "1h": "h",
+    "hourly": "h",
+    "2h": "h2",
+    "4h": "h4",
 }
 CHART_TYPES = {
     "c": ("c", "candle"),
@@ -108,108 +132,37 @@ DATE_RANGES = {
     "max": ("max", "max"),
     "all": ("max", "max"),
 }
-STOCK_INTRADAY_INTERVALS = {
-    "i1": "1m",
-    "i2": "2m",
-    "i3": "1m",
-    "i5": "5m",
-    "i15": "15m",
-    "i30": "30m",
-    "h": "60m",
-    "h4": "4h",
-}
-YAHOO_TIMEFRAME_INTERVALS = {
-    "d": "1d",
-    "w": "1wk",
-    "m": "1mo",
-    "i1": "1m",
-    "i2": "2m",
-    "i3": "1m",
-    "i5": "5m",
-    "i10": "5m",
-    "i15": "15m",
-    "i30": "30m",
-    "h": "60m",
-    "h2": "60m",
-    "h4": "4h",
-}
-YAHOO_INTRADAY_RANGES = {
-    "i1": "5d",
-    "i2": "5d",
-    "i3": "5d",
-    "i5": "5d",
-    "i10": "5d",
-    "i15": "5d",
-    "i30": "1mo",
-    "h": "1mo",
-    "h2": "3mo",
-    "h4": "1y",
-}
-DAILY_SMA_FETCH_RANGES = {
-    "": "2y",
-    "m1": "1y",
-    "m3": "1y",
-    "m6": "2y",
-    "ytd": "2y",
-    "y1": "2y",
-    "y2": "5y",
-    "y5": "10y",
-    "max": "max",
-}
-WEEKLY_SMA_FETCH_RANGES = {
-    "": "10y",
-    "m1": "5y",
-    "m3": "5y",
-    "m6": "5y",
-    "ytd": "5y",
-    "y1": "5y",
-    "y2": "10y",
-    "y5": "10y",
-    "max": "max",
-}
-YAHOO_AGGREGATE_SECONDS = {
-    "i2": 2 * 60,
-    "i3": 3 * 60,
-    "i10": 10 * 60,
-    "h2": 2 * 60 * 60,
-}
+DATE_RANGE_DAYS = {"m1": 31, "m3": 93, "m6": 186, "y1": 365, "y2": 730, "y5": 1826}
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,14}$")
-YAHOO_SYMBOL_ALIASES = {
-    "SPX": "^GSPC",
-    "NDX": "^NDX",
-    "DJX": "^DJI",
-    "DJI": "^DJI",
-    "DJIA": "^DJI",
-    "RUT": "^RUT",
-    "RUI": "^RUI",
-    "VIX": "^VIX",
-    "IXIC": "^IXIC",
-    "OEX": "^OEX",
-}
 CRYPTO_TICKER_ALIASES = {
     "BITCOIN": "BTC",
     "ETHEREUM": "ETH",
     "ETHER": "ETH",
     "DOGECOIN": "DOGE",
 }
-YAHOO_CRYPTO_SYMBOL_ALIASES = {
-    "BTC": "BTC-USD",
-    "ETH": "ETH-USD",
-    "DOGE": "DOGE-USD",
-}
-BINANCE_CRYPTO_SYMBOLS = {
+CRYPTO_SYMBOLS = {
     "BTC": ("BTCUSDT", "Bitcoin / TetherUS"),
     "ETH": ("ETHUSDT", "Ethereum / TetherUS"),
     "DOGE": ("DOGEUSDT", "Dogecoin / TetherUS"),
 }
+# `;p`, `;P` and `;D` are faces, not charts, unless chart options follow
+# (`;D d` still charts Dominion Energy daily).
+FACE_TOKENS = frozenset({"p", "P", "D"})
 STOCK_INTRADAY_UNSUPPORTED_MESSAGE = (
     "Stock intraday supports `1`, `2`, `3`, `5`, `15`, `30`, `60`, and `4h` "
     "via market chart data. Use `d`, `w`, or `m` for higher timeframes."
 )
+UNKNOWN_OPTION_MESSAGE = (
+    "Unknown chart option `{option}`. Use `d`, `w`, `m`, stock intraday `1`, `2`, `3`, `5`, "
+    "`15`, `30`, `60`, `4h`, `candle`, `line`, `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, "
+    "`max`, `dark`, `light`, `linear`, `log`, or `percent`. Crypto and futures also "
+    "support `10` and `2h`."
+)
 
 # Futures must not use `;f`: that is Ford's stock ticker. Use `;fut ES`.
 FUTURES_TICKER_RE = re.compile(r"^[A-Z0-9]{1,8}$")
-FUTURES_ALIASES = {"fut", "future", "futures"}
+FUTURES_ALIASES = frozenset({"fut", "future", "futures"})
+CHART_ALIASES = frozenset({"chart", "charts"})
 FUTURES_DISPLAY_NAMES = {
     "ES": "E-mini S&P 500",
     "MES": "Micro E-mini S&P 500",
@@ -265,69 +218,109 @@ class ChartData:
     last_close: float | None = None
     last_time: int | None = None
     previous_close: float | None = None
-    change: float | None = None
-    change_percent: float | None = None
     market_label: str = ""
     futures: bool = False
     source_interval_seconds: int | None = None
     preserve_last_bar: bool = False
+
+    @property
+    def change(self) -> float | None:
+        if self.last_close is None or not self.previous_close:
+            return None
+        return self.last_close - self.previous_close
+
+    @property
+    def change_percent(self) -> float | None:
+        change = self.change
+        if change is None or not self.previous_close:
+            return None
+        return change / self.previous_close * 100
 
 
 class NoChartData(ValueError):
     pass
 
 
+def is_intraday(timeframe: str) -> bool:
+    return timeframe.startswith(("i", "h"))
+
+
+def native_timeframe(timeframe: str, supported: Collection[str]) -> str:
+    """Pick the timeframe to fetch from a provider that natively has `supported`.
+
+    Intraday timeframes a provider lacks fall back to the coarsest supported
+    timeframe that divides them evenly; `aggregate_chart_data` rebuilds the
+    requested bars from those.
+    """
+    if timeframe in supported:
+        return timeframe
+    seconds = TIMEFRAMES[timeframe].seconds
+    divisors = [
+        code
+        for code in supported
+        if is_intraday(code) and seconds % TIMEFRAMES[code].seconds == 0
+    ]
+    if not is_intraday(timeframe) or not divisors:
+        raise ValueError(f"No source data for `{TIMEFRAMES[timeframe].label}` charts.")
+    return max(divisors, key=lambda code: TIMEFRAMES[code].seconds)
+
+
 def parse_chart_command(content: str) -> ChartRequest | None:
+    """Parse `;TICKER [options]`. None means the message is not a chart command."""
     if not content.startswith(PREFIX):
         return None
-
-    parts = content[len(PREFIX):].strip().split()
-    if not parts:
+    parts = content[len(PREFIX):].split()
+    if not parts or parts[0].lower() in HELP_COMMANDS:
         return None
 
-    if parts[0].lower() in {"help", "h"}:
-        return None
-    is_futures = False
-    if parts[0].lower() in FUTURES_ALIASES:
-        is_futures = True
+    command = parts[0].lower()
+    futures = command in FUTURES_ALIASES
+    explicit = futures or command in CHART_ALIASES
+    if explicit:
         parts = parts[1:]
         if not parts:
-            raise ValueError("Usage: `;fut ES`, `;fut CL w line`, or `;futures GC 1y`")
-    elif parts[0].lower() in {"chart", "charts"}:
-        parts = parts[1:]
-        if not parts:
-            raise ValueError("Usage: `;AAPL`, `;AAPL w`, or `;AAPL m line dark log`")
+            raise ValueError(
+                "Usage: `;fut ES`, `;fut CL w line`, or `;futures GC 1y`"
+                if futures
+                else "Usage: `;AAPL`, `;AAPL w`, or `;AAPL m line dark log`"
+            )
 
-    ticker = parts[0].upper().replace(".", "-")
-    if is_futures:
+    raw_ticker, options = parts[0], parts[1:]
+    ticker = raw_ticker.upper().replace(".", "-")
+    if futures:
         if not FUTURES_TICKER_RE.fullmatch(ticker):
             raise ValueError("Futures root looks wrong. Use roots like `;fut ES`, `;fut CL`, or `;fut 6E`.")
     elif not TICKER_RE.fullmatch(ticker):
-        raise ValueError("Ticker looks wrong. Use letters/numbers only, like `;AAPL` or `;BRK-B`.")
+        if explicit:
+            raise ValueError("Ticker looks wrong. Use letters/numbers only, like `;AAPL` or `;BRK-B`.")
+        return None  # chatter such as `;)` or `;_;`
     else:
         ticker = CRYPTO_TICKER_ALIASES.get(ticker, ticker)
-    is_crypto = not is_futures and ticker in BINANCE_CRYPTO_SYMBOLS
 
-    timeframe, timeframe_label = TIMEFRAMES[DEFAULT_TIMEFRAME]
-    timeframe_explicit = False
-    date_range_explicit = False
+    face = not explicit and raw_ticker in FACE_TOKENS
+    if face and not options:
+        return None
+    try:
+        return _parse_chart_options(ticker, options, futures=futures)
+    except ValueError:
+        if face:
+            return None  # `;p` followed by chatter
+        raise
+
+
+def _parse_chart_options(ticker: str, options: list[str], *, futures: bool) -> ChartRequest:
+    crypto = not futures and ticker in CRYPTO_SYMBOLS
+    timeframe: str | None = None
     chart_type, chart_type_label = CHART_TYPES[DEFAULT_CHART_TYPE]
     theme, theme_label = THEMES[DEFAULT_THEME]
     scale, scale_label = SCALES[DEFAULT_SCALE]
     date_range = date_range_label = ""
-    crypto_market = "auto" if is_crypto else ""
 
-    for raw_option in parts[1:]:
+    for raw_option in options:
         option = raw_option.lower()
-        if option in TIMEFRAMES:
-            timeframe, timeframe_label = TIMEFRAMES[option]
-            timeframe_explicit = True
-        elif option in FUTURES_TIMEFRAMES:
-            candidate_timeframe, candidate_label = FUTURES_TIMEFRAMES[option]
-            if is_futures or is_crypto or candidate_timeframe in STOCK_INTRADAY_INTERVALS:
-                timeframe, timeframe_label = candidate_timeframe, candidate_label
-                timeframe_explicit = True
-            else:
+        if option in TIMEFRAME_ALIASES:
+            timeframe = TIMEFRAME_ALIASES[option]
+            if not (futures or crypto or TIMEFRAMES[timeframe].stocks):
                 raise ValueError(STOCK_INTRADAY_UNSUPPORTED_MESSAGE)
         elif option in CHART_TYPES:
             chart_type, chart_type_label = CHART_TYPES[option]
@@ -337,67 +330,32 @@ def parse_chart_command(content: str) -> ChartRequest | None:
             scale, scale_label = SCALES[option]
         elif option in DATE_RANGES:
             date_range, date_range_label = DATE_RANGES[option]
-            date_range_explicit = True
         else:
-            raise ValueError(
-                f"Unknown chart option `{raw_option}`. Use `d`, `w`, `m`, stock intraday `1`, `2`, `3`, `5`, `15`, `30`, `60`, `4h`, `candle`, `line`, `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`, `dark`, `light`, `linear`, `log`, or `percent`. Futures also support `10` and `2h`."
-            )
+            raise ValueError(UNKNOWN_OPTION_MESSAGE.format(option=raw_option))
 
-    if not timeframe_explicit and not date_range_explicit:
-        timeframe, timeframe_label = DEFAULT_STOCK_TIMEFRAME, DEFAULT_STOCK_TIMEFRAME_LABEL
-
-    if date_range and timeframe.startswith(("i", "h")):
+    if timeframe is None:
+        timeframe = DEFAULT_TIMEFRAME if date_range else DEFAULT_INTRADAY_TIMEFRAME
+    if date_range and is_intraday(timeframe):
         raise ValueError(
             "Date ranges only work with `d`, `w`, or `m` charts. "
             "Use `;AAPL 1y` for a 1-year daily chart, or drop the range for intraday."
         )
 
     return ChartRequest(
-        ticker, timeframe, timeframe_label, chart_type, chart_type_label,
-        theme, theme_label, scale, scale_label, date_range, date_range_label, is_futures,
-        crypto_market,
+        ticker=ticker,
+        timeframe=timeframe,
+        timeframe_label=TIMEFRAMES[timeframe].label,
+        chart_type=chart_type,
+        chart_type_label=chart_type_label,
+        theme=theme,
+        theme_label=theme_label,
+        scale=scale,
+        scale_label=scale_label,
+        date_range=date_range,
+        date_range_label=date_range_label,
+        futures=futures,
+        crypto_market="auto" if crypto else "",
     )
-
-
-def yahoo_chart_symbol(request: ChartRequest) -> str:
-    if request.futures:
-        return f"{request.ticker}=F"
-    return YAHOO_CRYPTO_SYMBOL_ALIASES.get(
-        request.ticker,
-        YAHOO_SYMBOL_ALIASES.get(request.ticker, request.ticker),
-    )
-
-
-def _yahoo_chart_range(request: ChartRequest) -> str:
-    if request.timeframe in YAHOO_INTRADAY_RANGES:
-        return YAHOO_INTRADAY_RANGES[request.timeframe]
-    if request.timeframe == "d":
-        return DAILY_SMA_FETCH_RANGES.get(request.date_range, "2y")
-    if request.timeframe == "w":
-        return WEEKLY_SMA_FETCH_RANGES.get(request.date_range, "10y")
-    if request.timeframe == "m":
-        return "max"
-    raise ValueError(f"Chart data does not support `{request.timeframe_label}` charts.")
-
-
-def yahoo_chart_url(request: ChartRequest) -> str:
-    interval = YAHOO_TIMEFRAME_INTERVALS.get(request.timeframe)
-    if interval is None:
-        raise ValueError(f"Chart data does not support `{request.timeframe_label}` charts.")
-
-    include_prepost = not request.futures and request.timeframe in YAHOO_INTRADAY_RANGES
-    params = {
-        "interval": interval,
-        "includePrePost": "true" if include_prepost else "false",
-        "events": "div,splits",
-    }
-    if request.timeframe == "m":
-        params["period1"] = "0"
-        params["period2"] = str(int(dt.datetime.now(dt.timezone.utc).timestamp()))
-    else:
-        params["range"] = _yahoo_chart_range(request)
-    symbol = quote(yahoo_chart_symbol(request), safe="=^")
-    return f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?" + urlencode(params)
 
 
 def chart_title(request: ChartRequest, market_label: str | None = None) -> str:
@@ -442,7 +400,7 @@ def _range_cutoff(last_epoch: int, date_range: str) -> int | None:
     last = dt.datetime.fromtimestamp(last_epoch, dt.timezone.utc)
     if date_range == "ytd":
         return int(dt.datetime(last.year, 1, 1, tzinfo=dt.timezone.utc).timestamp())
-    days = {"m1": 31, "m3": 93, "m6": 186, "y1": 365, "y2": 730, "y5": 1826}.get(date_range)
+    days = DATE_RANGE_DAYS.get(date_range)
     return int((last - dt.timedelta(days=days)).timestamp()) if days else None
 
 
@@ -468,25 +426,18 @@ def _collapse_monthly_rows(rows: list[ChartRow]) -> list[ChartRow]:
     return collapsed
 
 
-def _source_interval_seconds(request: ChartRequest) -> int | None:
-    interval = YAHOO_TIMEFRAME_INTERVALS.get(request.timeframe)
-    if interval and interval.endswith("m") and interval[:-1].isdigit():
-        return int(interval[:-1]) * 60
-    if interval and interval.endswith("h") and interval[:-1].isdigit():
-        return int(interval[:-1]) * 60 * 60
-    return None
-
-
 def _drop_live_quote_row(
     rows: list[ChartRow],
     request: ChartRequest,
     source_interval_seconds: int | None = None,
     preserve_last_bar: bool = False,
 ) -> list[ChartRow]:
-    if preserve_last_bar:
+    if preserve_last_bar or len(rows) < 2:
         return rows
-    interval = source_interval_seconds or _source_interval_seconds(request)
-    if interval is None or len(rows) < 2:
+    interval = source_interval_seconds
+    if interval is None and is_intraday(request.timeframe):
+        interval = TIMEFRAMES[request.timeframe].seconds
+    if interval is None or interval >= WEEK:
         return rows
     epoch, open_, high, low, close, volume = rows[-1]
     previous_epoch = rows[-2][0]
@@ -498,73 +449,11 @@ def _drop_live_quote_row(
             request.futures
             or epoch % interval != 0
             or epoch - previous_epoch < interval
-            or not _is_regular_stock_session(epoch)
+            or not is_regular_session(epoch)
         )
     ):
         return rows[:-1]
     return rows
-
-
-def has_close_only_latest_ohlc(quote: dict[str, Any]) -> bool:
-    opens = quote.get("open") or []
-    highs = quote.get("high") or []
-    lows = quote.get("low") or []
-    closes = quote.get("close") or []
-    row_count = min(map(len, (opens, highs, lows, closes)))
-    if row_count == 0:
-        return False
-    last = row_count - 1
-    open_, high, low = (safe_float(values[last]) for values in (opens, highs, lows))
-    close = safe_float(closes[last])
-    return close is not None and close > 0 and open_ == high == low == 0
-
-
-def patch_close_only_latest_ohlc(quote: dict[str, Any], intraday_quote: dict[str, Any]) -> dict[str, Any]:
-    if not has_close_only_latest_ohlc(quote):
-        return quote
-
-    intraday_opens = intraday_quote.get("open") or []
-    intraday_highs = intraday_quote.get("high") or []
-    intraday_lows = intraday_quote.get("low") or []
-    intraday_closes = intraday_quote.get("close") or []
-    intraday_rows: list[tuple[float, float, float, float]] = []
-    for i in range(min(map(len, (intraday_opens, intraday_highs, intraday_lows, intraday_closes)))):
-        open_, high, low, close = (
-            safe_float(values[i])
-            for values in (intraday_opens, intraday_highs, intraday_lows, intraday_closes)
-        )
-        if open_ is None or high is None or low is None or close is None or high < low:
-            continue
-        if close > 0 and open_ == high == low == 0:
-            continue
-        intraday_rows.append((open_, high, low, close))
-    if not intraday_rows:
-        return quote
-
-    opens = quote.get("open") or []
-    highs = quote.get("high") or []
-    lows = quote.get("low") or []
-    closes = quote.get("close") or []
-    row_count = min(map(len, (opens, highs, lows, closes)))
-    last = row_count - 1
-    close = safe_float(closes[last])
-    if close is None:
-        return quote
-
-    patched = dict(quote)
-    patched_opens = list(opens)
-    patched_highs = list(highs)
-    patched_lows = list(lows)
-    patched_closes = list(closes)
-    patched_opens[last] = intraday_rows[0][0]
-    patched_highs[last] = max(row[1] for row in intraday_rows)
-    patched_lows[last] = min(row[2] for row in intraday_rows)
-    patched_closes[last] = close
-    patched["open"] = patched_opens
-    patched["high"] = patched_highs
-    patched["low"] = patched_lows
-    patched["close"] = patched_closes
-    return patched
 
 
 def normalize_chart_rows(
@@ -617,10 +506,13 @@ def _chart_rows(data: ChartData, request: ChartRequest) -> list[ChartRow]:
 
 
 def aggregate_chart_data(data: ChartData, request: ChartRequest) -> ChartData:
-    bucket_seconds = YAHOO_AGGREGATE_SECONDS.get(request.timeframe)
-    if bucket_seconds is None or (
-        data.source_interval_seconds is not None
-        and data.source_interval_seconds >= bucket_seconds
+    """Rebuild requested intraday bars from finer source bars (e.g. 3m from 1m)."""
+    bucket_seconds = TIMEFRAMES[request.timeframe].seconds
+    source_seconds = data.source_interval_seconds
+    if (
+        not is_intraday(request.timeframe)
+        or source_seconds is None
+        or source_seconds >= bucket_seconds
     ):
         return data
 
@@ -648,14 +540,14 @@ def _stock_5m_today_indexes(rows: Sequence[ChartRowValues], request: ChartReques
         return None
     last_local = dt.datetime.fromtimestamp(rows[-1][0], dt.timezone.utc).astimezone(MARKET_TIME_ZONE)
     session_date = last_local.date()
-    if last_local.time() >= STOCK_5M_END:
+    if last_local.time() >= EXTENDED_SESSION_END:
         session_date += dt.timedelta(days=1)
     start = dt.datetime.combine(
         session_date - dt.timedelta(days=1),
-        STOCK_5M_END,
+        EXTENDED_SESSION_END,
         MARKET_TIME_ZONE,
     ).timestamp()
-    end = dt.datetime.combine(session_date, STOCK_5M_END, MARKET_TIME_ZONE).timestamp()
+    end = dt.datetime.combine(session_date, EXTENDED_SESSION_END, MARKET_TIME_ZONE).timestamp()
     indexes = [i for i, row in enumerate(rows) if start <= row[0] < end]
     if len(indexes) >= SPARSE_CHART_MIN_BARS:
         return indexes
@@ -675,7 +567,7 @@ def _visible_indexes(rows: Sequence[ChartRowValues], request: ChartRequest) -> l
     elif request.date_range == "max":
         indexes = list(range(len(rows)))
     else:
-        if request.timeframe.startswith(("i", "h")):
+        if is_intraday(request.timeframe):
             count = FUTURES_INTRADAY_VISIBLE_BARS if request.futures else STOCK_INTRADAY_VISIBLE_BARS
         elif request.timeframe == "d" and not request.futures:
             count = STOCK_DAILY_VISIBLE_BARS
@@ -691,7 +583,7 @@ def _visible_indexes(rows: Sequence[ChartRowValues], request: ChartRequest) -> l
     return indexes
 
 
-def _is_regular_stock_session(epoch: int) -> bool:
+def is_regular_session(epoch: int) -> bool:
     local_time = dt.datetime.fromtimestamp(epoch, dt.timezone.utc).astimezone(MARKET_TIME_ZONE).time()
     return REGULAR_SESSION_START <= local_time < REGULAR_SESSION_END
 
@@ -699,13 +591,13 @@ def _is_regular_stock_session(epoch: int) -> bool:
 def _stock_extended_session_key(epoch: int) -> SessionKey | None:
     local = dt.datetime.fromtimestamp(epoch, dt.timezone.utc).astimezone(MARKET_TIME_ZONE)
     local_time = local.time()
-    if local_time >= STOCK_5M_END:
+    if local_time >= EXTENDED_SESSION_END:
         return "overnight", local.date() + dt.timedelta(days=1)
-    if local_time < STOCK_5M_START:
+    if local_time < EXTENDED_SESSION_START:
         return "overnight", local.date()
-    if STOCK_5M_START <= local_time < REGULAR_SESSION_START:
+    if EXTENDED_SESSION_START <= local_time < REGULAR_SESSION_START:
         return "pre", local.date()
-    if REGULAR_SESSION_END <= local_time < STOCK_5M_END:
+    if REGULAR_SESSION_END <= local_time < EXTENDED_SESSION_END:
         return "after", local.date()
     return None
 
@@ -770,12 +662,12 @@ def _clean_stock_extended_wicks(
     rows: Sequence[ChartRowValues],
     request: ChartRequest,
 ) -> list[ChartRowValues]:
-    if request.futures or not request.timeframe.startswith(("i", "h")):
+    if request.futures or not is_intraday(request.timeframe):
         return list(rows)
     regular_ranges = sorted(
         max(0.0, row[2] - row[3])
         for row in rows
-        if _is_regular_stock_session(row[0])
+        if is_regular_session(row[0])
     )
     typical_range = regular_ranges[len(regular_ranges) // 2] if regular_ranges else 0.0
     threshold = max(abs(rows[-1][4]) * EXTENDED_WICK_PCT_LIMIT, typical_range * EXTENDED_WICK_RANGE_MULTIPLE, 0.0001)
@@ -783,7 +675,7 @@ def _clean_stock_extended_wicks(
     for epoch, open_, high, low, close, volume in rows:
         body_high = max(open_, close)
         body_low = min(open_, close)
-        if not _is_regular_stock_session(epoch):
+        if not is_regular_session(epoch):
             if body_low - low > threshold:
                 low = body_low
             if high - body_high > threshold:
@@ -800,7 +692,7 @@ def _clean_futures_intraday_wicks(
     rows: Sequence[ChartRowValues],
     request: ChartRequest,
 ) -> list[ChartRowValues]:
-    if not request.futures or not request.timeframe.startswith(("i", "h")):
+    if not request.futures or not is_intraday(request.timeframe):
         return list(rows)
     ranges = sorted(max(0.0, row[2] - row[3]) for row in rows if row[2] >= row[3])
     typical_range = ranges[len(ranges) // 2] if ranges else 0.0
@@ -921,9 +813,8 @@ def _volume_axis(value: float, request: ChartRequest) -> tuple[float, list[float
     return high, ticks
 
 
-def _volume_scale_value(rows: Sequence[ChartRowValues], request: ChartRequest) -> float:
-    values = sorted(row[5] for row in rows if row[5] > 0)
-    return values[-1] if values else 0
+def _volume_scale_value(rows: Sequence[ChartRowValues]) -> float:
+    return max((row[5] for row in rows), default=0.0)
 
 
 def _date_label(epoch: int, intraday: bool, span: int) -> str:
@@ -976,7 +867,7 @@ def render_price_chart_png(data: ChartData, request: ChartRequest) -> bytes:
 
     width, height = DEFAULT_WIDTH * DEFAULT_SCALE_FACTOR, DEFAULT_HEIGHT * DEFAULT_SCALE_FACTOR
     dark = request.theme == "dark"
-    intraday = request.timeframe.startswith(("i", "h"))
+    intraday = is_intraday(request.timeframe)
     bg = (30, 34, 44) if dark else (250, 250, 250)
     grid = (43, 49, 62) if dark else (214, 218, 226)
     minor_grid = _blend_rgb(grid, bg, 0.52)
@@ -1053,7 +944,7 @@ def render_price_chart_png(data: ChartData, request: ChartRequest) -> bytes:
         pad = (high - low) * 0.055
         low, high = low - pad, high + pad
         y_ticks = [high - step * (high - low) / 4 for step in range(5)]
-    vol_axis_high, vol_ticks = _volume_axis(_volume_scale_value(rows, request), request)
+    vol_axis_high, vol_ticks = _volume_axis(_volume_scale_value(rows), request)
 
     x_positions = _chart_x_positions(len(candles), left, plot_w)
     if intraday and request.futures:
@@ -1224,38 +1115,43 @@ def render_price_chart_png(data: ChartData, request: ChartRequest) -> bytes:
     if close_points:
         draw.line(close_points, fill=line_color, width=2, joint="curve")
 
-    sma_scale = 4
-    sma_margin = 4
-    sma_left = max(0, left - sma_margin)
-    sma_top = max(0, price_top - sma_margin)
-    sma_right = min(width, plot_right + sma_margin + 1)
-    sma_bottom = min(height, draw_bottom + sma_margin + 1)
-    sma_size = ((sma_right - sma_left) * sma_scale, (sma_bottom - sma_top) * sma_scale)
-    sma_masks = {period: Image.new("L", sma_size, 0) for period in SMA_PERIODS}
-    sma_draws = {period: ImageDraw.Draw(mask) for period, mask in sma_masks.items()}
-    for period, values in smas.items():
-        points: list[tuple[float, float]] = []
-        for pos, i in enumerate(indexes):
-            value = values[i]
-            if value is not None:
-                points.append((float(x_at(pos)), price_y_at(scaled(value))))
-        for start, end in pairwise(points):
-            clipped = clip_price_segment(start, end)
-            if clipped is not None:
-                (x1, y1), (x2, y2) = clipped
-                sma_draws[period].line(
-                    (
-                        round((x1 - sma_left) * sma_scale),
-                        round((y1 - sma_top) * sma_scale),
-                        round((x2 - sma_left) * sma_scale),
-                        round((y2 - sma_top) * sma_scale),
-                    ),
-                    fill=255,
-                    width=max(1, round(1.25 * sma_scale)),
-                )
-    for period, mask in sma_masks.items():
-        mask = mask.resize((sma_right - sma_left, sma_bottom - sma_top), Image.Resampling.LANCZOS)
-        image.paste(sma_colors[period], (sma_left, sma_top, sma_right, sma_bottom), mask)
+    scale = SMA_SUPERSAMPLE
+    line_width = max(1, round(SMA_LINE_WIDTH * scale))
+    for period in SMA_PERIODS:
+        values = smas[period]
+        points = [
+            (float(x_at(pos)), price_y_at(scaled(value)))
+            for pos, i in enumerate(indexes)
+            if (value := values[i]) is not None
+        ]
+        segments = [
+            clipped
+            for start, end in pairwise(points)
+            if (clipped := clip_price_segment(start, end)) is not None
+        ]
+        if not segments:
+            continue
+        # Supersample only the line's own bounding box, not the whole plot.
+        xs = [x for segment in segments for x, _ in segment]
+        ys = [y for segment in segments for _, y in segment]
+        box_left = max(0, math.floor(min(xs)) - SMA_MASK_MARGIN)
+        box_top = max(0, math.floor(min(ys)) - SMA_MASK_MARGIN)
+        box_right = min(width, math.ceil(max(xs)) + SMA_MASK_MARGIN + 1)
+        box_bottom = min(height, math.ceil(max(ys)) + SMA_MASK_MARGIN + 1)
+        mask = Image.new("L", ((box_right - box_left) * scale, (box_bottom - box_top) * scale), 0)
+        mask_draw = ImageDraw.Draw(mask)
+        for (x1, y1), (x2, y2) in segments:
+            mask_draw.line(
+                (
+                    round((x1 - box_left) * scale),
+                    round((y1 - box_top) * scale),
+                    round((x2 - box_left) * scale),
+                    round((y2 - box_top) * scale),
+                ),
+                fill=255,
+                width=line_width,
+            )
+        image.paste(sma_colors[period], (box_left, box_top, box_right, box_bottom), mask.reduce(scale))
 
     last_idx = indexes[-1]
     last = all_rows[last_idx]
@@ -1351,9 +1247,9 @@ def _header_volume_label(row: ChartRowValues, request: ChartRequest) -> str:
     if request.crypto_market:
         return _fmt_volume(row[5])
     if (
-        _source_interval_seconds(request) is not None
+        is_intraday(request.timeframe)
         and row[5] == 0
-        and (request.futures or not _is_regular_stock_session(row[0]))
+        and (request.futures or not is_regular_session(row[0]))
     ):
         return "n/a"
     return _fmt_volume(row[5])
@@ -1369,53 +1265,6 @@ def _quote_time_label(data: ChartData) -> str | None:
     return stamp.strftime("%I:%M %p ET").lstrip("0")
 
 
-def stock_previous_close(meta: dict[str, Any], closes: list[Any], request: ChartRequest) -> float | None:
-    valid_closes = [close for close in (safe_float(value) for value in closes) if close is not None]
-    if request.timeframe == "d" and len(valid_closes) > 1:
-        latest_raw_close = safe_float(closes[-1]) if closes else None
-        if latest_raw_close is None:
-            previous = safe_float(meta.get("previousClose"))
-            if previous is not None:
-                return previous
-            chart_previous = safe_float(meta.get("chartPreviousClose"))
-            if chart_previous is not None:
-                return chart_previous
-            return valid_closes[-1]
-        return valid_closes[-2]
-    previous = safe_float(meta.get("previousClose"))
-    if previous is not None:
-        return previous
-    chart_previous = safe_float(meta.get("chartPreviousClose"))
-    if chart_previous is not None:
-        return chart_previous
-    return valid_closes[-2] if len(valid_closes) > 1 else None
-
-
-def latest_quote_price_time(
-    meta: dict[str, Any],
-    dates: list[Any],
-    closes: list[Any],
-    request: ChartRequest,
-) -> tuple[float | None, int | None]:
-    latest_close = next(
-        (close for close in (safe_float(value) for value in reversed(closes)) if close is not None),
-        None,
-    )
-    latest_time = int(dates[-1]) if dates else None
-    regular_price = safe_float(meta.get("regularMarketPrice"))
-    regular_time_float = safe_float(meta.get("regularMarketTime"))
-    regular_time = int(regular_time_float) if regular_time_float is not None else None
-    if (
-        not request.futures
-        and request.timeframe in YAHOO_INTRADAY_RANGES
-        and latest_close is not None
-        and latest_time is not None
-        and (regular_time is None or latest_time > regular_time)
-    ):
-        return latest_close, latest_time
-    return (regular_price if regular_price is not None else latest_close), (regular_time or latest_time)
-
-
 def _quote_display_name(data: ChartData) -> str:
     ticker = data.ticker.upper()
     if data.futures and ticker in FUTURES_DISPLAY_NAMES:
@@ -1425,7 +1274,7 @@ def _quote_display_name(data: ChartData) -> str:
 
 def quote_description(data: ChartData) -> str:
     metric_parts = [f"Last **{_fmt(data.last_close)}**"]
-    if data.change is not None or data.change_percent is not None:
+    if data.change is not None:
         metric_parts.append(f"**{_fmt_signed(data.change)}** ({_fmt_signed(data.change_percent, '%')})")
     time_label = _quote_time_label(data)
     if time_label:

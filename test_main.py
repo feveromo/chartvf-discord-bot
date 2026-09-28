@@ -7,13 +7,10 @@ from typing import Any, cast
 import aiohttp
 
 from charting import ChartRequest, NoChartData
-from main import (
-    MarketDataHTTPError,
-    _fetch_binance_klines,
-    _request_json,
-    fetch_crypto_chart_data,
-    fetch_market_chart_data,
-)
+from crypto import _fetch_binance_klines, fetch_crypto_chart_data
+from market_data import fetch_market_chart_data
+from market_http import MarketDataHTTPError, request_json
+from webull import _resolution_cache
 
 
 class FakeResponse:
@@ -78,7 +75,14 @@ class FakeSession:
         self.calls: list[tuple[str, dict[str, Any] | None]] = []
         self.websocket = FakeWebSocket(websocket_messages or [])
 
-    def get(self, url: str, *, params: dict[str, Any] | None = None) -> FakeResponse:
+    def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> FakeResponse:
+        del headers
         copied_params = dict(params) if params is not None else None
         self.calls.append((url, copied_params))
         return self.router(url, copied_params)
@@ -125,7 +129,7 @@ def tradingview_chart_messages(
 def yahoo_payload(
     *,
     closes: list[float],
-    previous_close: float,
+    previous_close: float | None,
     interval: str = "5m",
     name: str = "Test instrument",
 ) -> dict[str, Any]:
@@ -168,14 +172,14 @@ async def test_retry_once() -> None:
         FakeResponse(200, {"ok": True}),
     ]
     session, fake = session_for(lambda _url, _params: responses.pop(0))
-    assert await _request_json(session, "https://example.test/data") == {"ok": True}
+    assert await request_json(session, "https://example.test/data") == {"ok": True}
     assert len(fake.calls) == 2
 
 
 async def test_non_retryable_statuses_fail_once_and_preserve_no_data() -> None:
     session, fake = session_for(lambda _url, _params: FakeResponse(451, {}))
     try:
-        await _request_json(session, "https://example.test/restricted")
+        await request_json(session, "https://example.test/restricted")
     except MarketDataHTTPError as error:
         assert error.status == 451
     else:
@@ -205,6 +209,24 @@ async def test_index_alias_uses_yahoo_previous_close_without_daily_fetch() -> No
     assert data.source_interval_seconds == 300
     assert len(fake.calls) == 1
 
+async def test_weekly_change_uses_previous_daily_close() -> None:
+    # Yahoo's weekly/monthly meta has no previousClose, only chartPreviousClose:
+    # the close before the 10-year window. The day change must not use it.
+    weekly = yahoo_payload(closes=[100.0, 300.0, 340.0], previous_close=None, interval="1wk")
+    weekly["chart"]["result"][0]["meta"]["chartPreviousClose"] = 28.0
+    daily = yahoo_payload(closes=[330.0, 335.0, 340.0], previous_close=None, interval="1d")
+
+    def route(url: str, _params: dict[str, Any] | None) -> FakeResponse:
+        return FakeResponse(200, daily if "interval=1d" in url else weekly)
+
+    session, fake = session_for(route)
+    data = await fetch_market_chart_data(session, ChartRequest("AAPL", "w", "weekly"))
+    assert data.previous_close == 335.0
+    assert data.change == 5.0
+    assert len(fake.calls) == 2
+    assert "interval=1d" in fake.calls[1][0] and "range=5d" in fake.calls[1][0]
+
+
 async def test_stock_intraday_uses_tradingview_24h_session() -> None:
     primary_rows = [
         {"i": 2, "v": [1_787_634_000, 263.57, 263.57, 263.20, 263.25, 2964.0]},
@@ -224,10 +246,13 @@ async def test_stock_intraday_uses_tradingview_24h_session() -> None:
         }
     ) + messages[0]
 
-    def unexpected_http(url: str, _params: dict[str, Any] | None) -> FakeResponse:
-        raise AssertionError(f"Unexpected HTTP request: {url}")
+    def webull_unlisted(url: str, _params: dict[str, Any] | None) -> FakeResponse:
+        # Webull doesn't know the symbol, so the bot falls back to TradingView.
+        assert url.startswith("https://quotes-gw.webullfintech.com/"), url
+        return FakeResponse(200, {"data": []})
 
-    session, fake = session_for(unexpected_http, messages)
+    _resolution_cache.clear()
+    session, fake = session_for(webull_unlisted, messages)
     data = await fetch_market_chart_data(
         session,
         ChartRequest("AMZN", "i15", "15 min"),
@@ -244,7 +269,7 @@ async def test_stock_intraday_uses_tradingview_24h_session() -> None:
     assert data.market_label == "TradingView 24h"
     assert not data.futures
     assert data.source_interval_seconds == 900
-    assert not fake.calls
+    assert [url.rsplit("/", 1)[-1] for url, _params in fake.calls] == ["tickers"]
     sent = "".join(fake.websocket.sent)
     assert "AMZN" in sent
     assert "24h" in sent
@@ -383,6 +408,7 @@ async def run_tests() -> None:
     await test_retry_once()
     await test_non_retryable_statuses_fail_once_and_preserve_no_data()
     await test_index_alias_uses_yahoo_previous_close_without_daily_fetch()
+    await test_weekly_change_uses_previous_daily_close()
     await test_stock_intraday_uses_tradingview_24h_session()
     await test_futures_uses_tradingview_full_session_and_daily_reference()
     await test_okx_is_primary_for_perp_and_uses_rolling_24h_change()

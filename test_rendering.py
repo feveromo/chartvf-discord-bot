@@ -2,7 +2,6 @@ import datetime as dt
 import hashlib
 import io
 import math
-import os
 import time
 
 from PIL import Image
@@ -10,11 +9,12 @@ from PIL import Image
 from charting import ChartData, ChartRequest, normalize_chart_rows, render_price_chart_png
 
 
+RENDER_LIMIT_MS = 100
 EXPECTED_RGB_HASHES = {
-    "stock_i5_light": "95c9bd6a18492dbddc9f0d888279a9f6886411663cda1f4852e395d7b38de5dd",
-    "stock_daily_dark_line": "f72a992c42aaf9ef049bd5f5e84c17bd16b723f523f1ff6be9d283872bd19389",
-    "futures_i15_light": "083801cd73a52b4af42b449b3af467091af081bb09760b87fcbce7bfc41e437a",
-    "crypto_daily_percent": "af6ee0464d7a44ef24ef421ace16ae7f99c818ce76a37a6fae2fc40ea578b201",
+    "stock_i5_light": "6a4ee7a8dfc74c0fc0a7f20bde82d2c67cac7a2723fc82a321e8919ba172c296",
+    "stock_daily_dark_line": "93bab841c2c7c6af932ea13ae75a642941141d185a42004051169dfa7c10efb0",
+    "futures_i15_light": "d80b0c75c053d97d34355a06953e739c92a8363748019bdadb16bf5e317daa99",
+    "crypto_daily_percent": "afd3a7baedd9cca4f2ef861ee47fe9c757d3b734029144b28fff50e214e75f0f",
 }
 
 
@@ -35,17 +35,13 @@ def make_data(
     highs = [max(open_, close) + 0.48 + (index % 4) * 0.03 for index, (open_, close) in enumerate(zip(opens, closes, strict=True))]
     lows = [min(open_, close) - 0.44 - (index % 3) * 0.04 for index, (open_, close) in enumerate(zip(opens, closes, strict=True))]
     volumes = [100_000 + (index % 17) * 12_345 for index in range(count)]
-    previous = closes[-2]
-    change = closes[-1] - previous
     return ChartData(
         ticker=ticker,
         name=f"{ticker} Test Instrument",
         rows=normalize_chart_rows(dates, opens, highs, lows, closes, volumes),
         last_close=closes[-1],
         last_time=dates[-1],
-        previous_close=previous,
-        change=change,
-        change_percent=change / previous * 100,
+        previous_close=closes[-2],
         market_label=market_label,
         futures=futures,
         source_interval_seconds=source_interval_seconds,
@@ -115,8 +111,8 @@ def test_rendering_regressions() -> None:
         render_price_chart_png(benchmark_data, benchmark_request)
         timings.append((time.perf_counter() - started) * 1000)
     average_ms = sum(timings) / len(timings)
-    limit_ms = 175 if os.getenv("CI") else 115
-    assert average_ms <= limit_ms, f"Average warm render took {average_ms:.1f} ms"
+    # Renders take ~35 ms; the old full-plot LANCZOS SMA masks took ~170 ms.
+    assert average_ms <= RENDER_LIMIT_MS, f"Average warm render took {average_ms:.1f} ms"
 
 
 if __name__ == "__main__":
