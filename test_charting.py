@@ -36,6 +36,7 @@ from charting import (
     _stock_extended_session_key,
     _visible_indexes,
     _volume_axis,
+    _volume_profile,
     _volume_scale_value,
     _x_grid_line_styles,
     aggregate_chart_data,
@@ -137,6 +138,24 @@ def test_charting_regressions() -> None:
     assert parse_chart_command(";aapl m line dark log") == ChartRequest(
         "AAPL", "m", "monthly", "l", "line", "dark", "dark", "logarithmic", "log"
     )
+    assert parse_chart_command(";spy d vp") == ChartRequest("SPY", "d", "daily", volume_profile=True)
+    assert parse_chart_command(";hims VPVR w") == ChartRequest("HIMS", "w", "weekly", volume_profile=True)
+    assert chart_title(ChartRequest("SPY", "d", "daily", volume_profile=True)) == "SPY · daily candles · volume profile"
+    # Bars are (open, high, low, close, volume); rows span 10-20 in steps of 1.
+    profile = _volume_profile([
+        (10.0, 12.0, 10.0, 12.0, 400.0),
+        (14.5, 15.0, 14.0, 14.0, 300.0),
+        (15.0, 16.0, 15.0, 16.0, 900.0),
+        (16.0, 18.0, 16.0, 18.0, 500.0),
+        (20.0, 20.0, 18.0, 18.0, 100.0),
+    ], rows=10)
+    assert profile is not None
+    assert profile.low == 10.0 and profile.step == 1.0
+    assert profile.up == [200.0, 200.0, 0.0, 0.0, 0.0, 900.0, 250.0, 250.0, 0.0, 0.0]
+    assert profile.down == [0.0, 0.0, 0.0, 0.0, 300.0, 0.0, 0.0, 0.0, 50.0, 50.0]
+    assert profile.poc == 5
+    assert (profile.value_low, profile.value_high) == (4, 7)
+    assert _volume_profile([(10.0, 11.0, 9.0, 10.5, 0.0)]) is None
     ranged = parse_chart_command(";aapl 1y")
     assert ranged is not None
     assert ranged.timeframe == "d" and ranged.date_range == "y1"

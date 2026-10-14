@@ -27,6 +27,8 @@ Options can be in any order after the ticker.
 | `;AAPL w 5y` | 5-year weekly chart |
 | `;AAPL dark log` | dark theme, log scale |
 | `;AAPL percent` | percent scale |
+| `;SPY d vp` | daily chart with volume profile |
+| `;HIMS w vp` | weekly chart with volume profile |
 | `;BTC d` | Bitcoin daily chart |
 | `;ETH 1y percent` | Ethereum 1-year percent chart |
 | `;DOGE d` | Dogecoin daily chart |
@@ -53,6 +55,11 @@ don't trigger the bot. `;d` or `;D d` still charts Dominion Energy (`D`).
 | Ranges | `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max` |
 | Themes | `light`, `dark` |
 | Scales | `linear`, `log`, `percent` |
+| Volume profile | `vp` (also `vpvr`, `vrvp`, `profile`) |
+
+The volume profile covers the visible bars, like TradingView's VRVP: 24 price rows with buying
+volume in blue and selling volume in violet, a shaded 70% value area, and a gold POC line. The
+POC price is listed under the SMA legend.
 
 Bare stock and crypto commands default to the latest 5-minute chart. U.S. stock
 intraday charts use real-time Webull candles (anonymous tick-level stream plus native interval history,

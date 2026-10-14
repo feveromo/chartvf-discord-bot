@@ -15,6 +15,7 @@ EXPECTED_RGB_HASHES = {
     "stock_daily_dark_line": "93bab841c2c7c6af932ea13ae75a642941141d185a42004051169dfa7c10efb0",
     "futures_i15_light": "d80b0c75c053d97d34355a06953e739c92a8363748019bdadb16bf5e317daa99",
     "crypto_daily_percent": "afd3a7baedd9cca4f2ef861ee47fe9c757d3b734029144b28fff50e214e75f0f",
+    "stock_weekly_volume_profile": "1f83e84830ac64e6093500b9c57375380bfe1e8f2bea2c3f89a5c7cf484a2fd1",
 }
 
 
@@ -94,6 +95,10 @@ def render_cases() -> dict[str, tuple[ChartData, ChartRequest]]:
                 source_interval_seconds=86400,
             ),
             ChartRequest("BTC", "d", "daily", scale="percentage", scale_label="percent", crypto_market="auto"),
+        ),
+        "stock_weekly_volume_profile": (
+            make_data("HIMS", int(dt.datetime(2023, 10, 2, tzinfo=utc).timestamp()), 7 * 86400, 160, 30),
+            ChartRequest("HIMS", "w", "weekly", volume_profile=True),
         ),
     }
 

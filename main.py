@@ -38,6 +38,7 @@ HELP_TEXT = """**ChartVF**
 `;QQQ w line` → weekly line chart
 `;LULU 1y` → 1-year chart
 `;AAPL dark log` → dark theme, log scale
+`;SPY d vp` → daily chart with volume profile
 `;fut ES` → E-mini S&P latest 5-minute chart
 `;fut ES 15` → E-mini S&P 15-minute chart
 `;fut CL w line` → crude oil weekly line
@@ -52,6 +53,7 @@ Types: `candle`, `line`
 Ranges: `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, `max`
 Themes: `dark`, `light`
 Scales: `linear`, `log`, `percent`
+Volume profile: `vp` (any timeframe; value area shaded, POC line)
 
 Options can be in any order after the ticker.
 

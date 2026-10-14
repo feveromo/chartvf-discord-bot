@@ -34,6 +34,16 @@ SMA_COLORS = {20: (142, 43, 132), 50: (238, 126, 35), 200: (139, 111, 43)}
 SMA_SUPERSAMPLE = 4
 SMA_LINE_WIDTH = 1.25
 SMA_MASK_MARGIN = 2
+# TradingView's visible-range volume profile defaults: 24 rows, 70% value area.
+VOLUME_PROFILE_OPTIONS = {"vp", "vpvr", "vrvp", "profile"}
+VOLUME_PROFILE_ROWS = 24
+VOLUME_PROFILE_VALUE_AREA = 0.70
+VOLUME_PROFILE_WIDTH = 0.3
+# Per theme: up-volume, down-volume, and POC colors.
+VOLUME_PROFILE_COLORS = {
+    "light": ((59, 130, 246), (139, 92, 246), (214, 150, 20)),
+    "dark": ((96, 165, 250), (167, 139, 250), (245, 200, 60)),
+}
 LIGHT_DAILY_UP = (21, 141, 54)
 LIGHT_DAILY_DOWN = (213, 33, 45)
 LIGHT_DAILY_VOLUME_ALPHA = 0.28
@@ -155,7 +165,7 @@ STOCK_INTRADAY_UNSUPPORTED_MESSAGE = (
 UNKNOWN_OPTION_MESSAGE = (
     "Unknown chart option `{option}`. Use `d`, `w`, `m`, stock intraday `1`, `2`, `3`, `5`, "
     "`15`, `30`, `60`, `4h`, `candle`, `line`, `1m`, `3m`, `6m`, `ytd`, `1y`, `2y`, `5y`, "
-    "`max`, `dark`, `light`, `linear`, `log`, or `percent`. Crypto and futures also "
+    "`max`, `dark`, `light`, `linear`, `log`, `percent`, or `vp`. Crypto and futures also "
     "support `10` and `2h`."
 )
 
@@ -196,6 +206,7 @@ class ChartRequest:
     date_range_label: str = ""
     futures: bool = False
     crypto_market: CryptoMarket = ""
+    volume_profile: bool = False
 
 
 class ChartRow(NamedTuple):
@@ -315,6 +326,7 @@ def _parse_chart_options(ticker: str, options: list[str], *, futures: bool) -> C
     theme, theme_label = THEMES[DEFAULT_THEME]
     scale, scale_label = SCALES[DEFAULT_SCALE]
     date_range = date_range_label = ""
+    volume_profile = False
 
     for raw_option in options:
         option = raw_option.lower()
@@ -330,6 +342,8 @@ def _parse_chart_options(ticker: str, options: list[str], *, futures: bool) -> C
             scale, scale_label = SCALES[option]
         elif option in DATE_RANGES:
             date_range, date_range_label = DATE_RANGES[option]
+        elif option in VOLUME_PROFILE_OPTIONS:
+            volume_profile = True
         else:
             raise ValueError(UNKNOWN_OPTION_MESSAGE.format(option=raw_option))
 
@@ -355,6 +369,7 @@ def _parse_chart_options(ticker: str, options: list[str], *, futures: bool) -> C
         date_range_label=date_range_label,
         futures=futures,
         crypto_market="auto" if crypto else "",
+        volume_profile=volume_profile,
     )
 
 
@@ -368,6 +383,8 @@ def chart_title(request: ChartRequest, market_label: str | None = None) -> str:
         parts.append(request.scale_label)
     if request.theme != DEFAULT_THEME:
         parts.append(request.theme_label)
+    if request.volume_profile:
+        parts.append("volume profile")
     if market_label is not None:
         parts.append(market_label)
     if request.futures:
@@ -759,6 +776,58 @@ def _sma_values(rows: Sequence[ChartRowValues], period: int) -> list[float | Non
     return values
 
 
+class VolumeProfile(NamedTuple):
+    low: float
+    step: float
+    up: list[float]
+    down: list[float]
+    poc: int
+    value_low: int
+    value_high: int
+
+
+def _volume_profile(
+    bars: Sequence[tuple[float, float, float, float, float]],
+    rows: int = VOLUME_PROFILE_ROWS,
+) -> VolumeProfile | None:
+    # Spreads each bar's volume evenly across its high-low range, split by bar direction.
+    low = min(bar[2] for bar in bars)
+    high = max(bar[1] for bar in bars)
+    step = (high - low) / rows or 1.0
+    up = [0.0] * rows
+    down = [0.0] * rows
+    for open_, bar_high, bar_low, close, volume in bars:
+        if volume <= 0:
+            continue
+        side = up if close >= open_ else down
+        first = min(rows - 1, int((bar_low - low) / step))
+        last = min(rows - 1, int((bar_high - low) / step))
+        if first == last:
+            side[first] += volume
+            continue
+        for row in range(first, last + 1):
+            overlap = min(bar_high, low + (row + 1) * step) - max(bar_low, low + row * step)
+            if overlap > 0:
+                side[row] += volume * overlap / (bar_high - bar_low)
+    totals = [up_volume + down_volume for up_volume, down_volume in zip(up, down, strict=True)]
+    total = sum(totals)
+    if total <= 0:
+        return None
+    poc = max(range(rows), key=totals.__getitem__)
+    value_low = value_high = poc
+    covered = totals[poc]
+    while covered < total * VOLUME_PROFILE_VALUE_AREA:
+        below = totals[value_low - 1] if value_low > 0 else -1.0
+        above = totals[value_high + 1] if value_high < rows - 1 else -1.0
+        if above >= below:
+            value_high += 1
+            covered += above
+        else:
+            value_low -= 1
+            covered += below
+    return VolumeProfile(low, step, up, down, poc, value_low, value_high)
+
+
 def _axis_label(value: float, request: ChartRequest) -> str:
     if request.scale == "percentage":
         return f"{value:.0f}%"
@@ -885,6 +954,8 @@ def render_price_chart_png(data: ChartData, request: ChartRequest) -> bytes:
         vol_down = _blend_rgb(down, bg, LIGHT_DAILY_VOLUME_ALPHA)
     sma_alpha = 0.82 if dark else 0.72
     sma_colors = {period: _blend_rgb(SMA_COLORS[period], bg, sma_alpha) for period in SMA_PERIODS}
+    profile_up, profile_down, profile_poc = VOLUME_PROFILE_COLORS[request.theme]
+    profile_alpha, profile_value_alpha = (44, 104) if dark else (40, 96)
 
     header_font = _font(18)
     label_font = _font(17, True)
@@ -1087,6 +1158,33 @@ def render_price_chart_png(data: ChartData, request: ChartRequest) -> bytes:
             label_x = max(x1 + 4, min(x2 - label_w - 4, x1 + (x2 - x1 - label_w) // 2))
             draw.text((label_x, price_top + 4), label, fill=session_text, font=small_font)
 
+    profile = None
+    if request.volume_profile:
+        profile = _volume_profile([candle[2:] for candle in candles])
+        if profile is None:
+            raise NoChartData(f"No volume data for `{request.ticker}`, so volume profile won't work.")
+        # Semi-transparent like TradingView, drawn before candles so price stays on top.
+        overlay = Image.new("RGBA", (plot_w, price_bottom - price_top), (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
+        peak = max(up_volume + down_volume for up_volume, down_volume in zip(profile.up, profile.down, strict=True))
+        max_bar_w = plot_w * VOLUME_PROFILE_WIDTH
+        for row, (up_volume, down_volume) in enumerate(zip(profile.up, profile.down, strict=True)):
+            row_top = y_at(profile.low + (row + 1) * profile.step) - price_top + 1
+            row_bottom = y_at(profile.low + row * profile.step) - price_top - 1
+            alpha = profile_value_alpha if profile.value_low <= row <= profile.value_high else profile_alpha
+            up_right = plot_w - 1
+            up_left = up_right - round(up_volume / peak * max_bar_w)
+            down_left = up_left - round(down_volume / peak * max_bar_w)
+            if row_bottom < row_top:
+                continue
+            if up_left < up_right:
+                overlay_draw.rectangle((up_left + 1, row_top, up_right, row_bottom), fill=(*profile_up, alpha))
+            if down_left < up_left:
+                overlay_draw.rectangle((down_left + 1, row_top, up_left, row_bottom), fill=(*profile_down, alpha))
+        poc_y = y_at(profile.low + (profile.poc + 0.5) * profile.step) - price_top
+        overlay_draw.line((0, poc_y, plot_w - 1, poc_y), fill=(*profile_poc, 210), width=2)
+        image.paste(overlay, (left, price_top), overlay)
+
     candle_w = max(2, min(8, round(plot_w / max(len(candles), 1) * 0.68)))
 
     def bar_bounds(x: int) -> tuple[int, int]:
@@ -1183,6 +1281,14 @@ def render_price_chart_png(data: ChartData, request: ChartRequest) -> bytes:
         value = smas[period][last_idx]
         if value is not None:
             draw.text((8, 46 + row * 22), f"SMA {period} · {_fmt(value)}", fill=sma_colors[period], font=sma_font)
+    if profile is not None:
+        poc_value = profile.low + (profile.poc + 0.5) * profile.step
+        if request.scale == "percentage":
+            poc_value = base * (1.0 + poc_value / 100.0)
+        elif request.scale == "logarithmic":
+            poc_value = math.exp(poc_value)
+        legend_row = sum(smas[period][last_idx] is not None for period in SMA_PERIODS)
+        draw.text((8, 46 + legend_row * 22), f"VP POC · {_fmt(poc_value)}", fill=profile_poc, font=sma_font)
     if period_shell:
         side_font = _font(14)
         label = request.timeframe_label.upper()
