@@ -1,0 +1,3 @@
+{
+  "exclude": [".venv/", ".codegraph/", ".git/", "__pycache__/", ".pytest_cache/", ".ruff_cache/", ".pi/", ".env", ".env.*"]
+}
