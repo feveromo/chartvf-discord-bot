@@ -458,7 +458,7 @@ def _drop_live_quote_row(
         return rows
     epoch, open_, high, low, close, volume = rows[-1]
     previous_epoch = rows[-2][0]
-    # ponytail: Yahoo appends a live quote row; it is not a finished candle.
+    # Yahoo appends a live quote row; it is not a finished candle.
     if (
         volume == 0
         and open_ == high == low == close
