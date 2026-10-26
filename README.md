@@ -92,7 +92,17 @@ Enable **Message Content Intent** for the bot in the Discord Developer Portal.
 2. In Railway, create a new project from the GitHub repo.
 3. Add a Railway variable named `DISCORD_TOKEN` with your Discord bot token.
 4. Confirm **Message Content Intent** is enabled for the bot in the Discord Developer Portal.
-5. Deploy the service. The repo's `railway.toml` sets the start command to `python main.py`.
+5. Deploy the service.
+
+`.railway/railway.py` holds the service settings: the `python main.py` start command, watch
+paths so test- and docs-only pushes don't redeploy, one replica, and 1 vCPU / 512 MB limits.
+Railway doesn't read that file during deploys. After a change, preview and apply it from an
+activated virtualenv:
+
+```bash
+railway config plan
+railway config apply
+```
 
 This bot is a long-running Discord worker, not an HTTP web service, so it does not need a
 `PORT` binding or Railway healthcheck path.
