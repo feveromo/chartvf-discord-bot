@@ -279,6 +279,24 @@ def test_charting_regressions() -> None:
     for longer_crypto_command in (";btc d", ";btc w", ";btc m", ";btc 1y", ";btc max", ";eth w", ";doge d"):
         req = parse_chart_command(longer_crypto_command)
         assert req is not None and req.crypto_market == "auto" and not req.timeframe.startswith(("i", "h"))
+    xlm_daily = ChartRequest("XLM", "d", "daily", crypto_market="auto")
+    assert parse_chart_command(";xlm d") == xlm_daily
+    assert parse_chart_command(";stellar d") == xlm_daily
+    link_daily = ChartRequest("LINK", "d", "daily", crypto_market="auto")
+    assert parse_chart_command(";link d") == ChartRequest("LINK", "d", "daily")  # Interlink
+    for coin_command in (";crypto link d", ";crypto LINK-USD d", ";link-usd d", ";chainlink d"):
+        assert parse_chart_command(coin_command) == link_daily
+    one_inch = parse_chart_command(";crypto 1inch 10")
+    assert one_inch is not None and (one_inch.ticker, one_inch.timeframe) == ("1INCH", "i10")
+    pepu = parse_chart_command(";pepu 10", {"PEPU"})
+    assert pepu is not None and pepu.crypto_market == "auto"
+    for bad_crypto_command in (";crypto", ";crypto $$"):
+        try:
+            parse_chart_command(bad_crypto_command)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad_crypto_command} should be rejected")
     assert "BTC-USD" in yahoo_chart_url(ChartRequest("BTC", "d", "daily"))
     assert "ETH-USD" in yahoo_chart_url(ChartRequest("ETH", "d", "daily"))
     assert "DOGE-USD" in yahoo_chart_url(ChartRequest("DOGE", "d", "daily"))

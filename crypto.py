@@ -1,5 +1,9 @@
-"""Crypto charts: OKX perpetuals for intraday, Binance spot history otherwise."""
+"""Crypto charts: OKX perpetuals for intraday, Binance spot history otherwise.
 
+Each falls back to the other, so a coin listed on either one charts.
+"""
+
+import asyncio
 import datetime as dt
 import logging
 import time
@@ -8,8 +12,8 @@ from typing import Any
 import aiohttp
 
 from charting import (
-    CRYPTO_SYMBOLS,
     DATE_RANGE_DAYS,
+    MAIN_COINS,
     SMA_PERIODS,
     TIMEFRAMES,
     ChartData,
@@ -28,14 +32,23 @@ from market_http import (
     background,
     request_json,
 )
+from yahoo import YAHOO_SYMBOL_ALIASES
 
 LOGGER = logging.getLogger("chartvf.crypto")
 
 BINANCE_SPOT_BASE_URL = "https://data-api.binance.vision"
-BINANCE_FUTURES_BASE_URL = "https://fapi.binance.com"
-BINANCE_KLINE_LIMITS = {"spot": 1000, "perp": 1500}
+BINANCE_KLINE_LIMIT = 1000
 OKX_BASE_URL = "https://www.okx.com"
 OKX_PAGE_SIZE = 300
+OKX_UNKNOWN_INSTRUMENT = "51001"
+OKX_CRYPTO_CATEGORY = "1"  # OKX also lists stock and commodity perps.
+COINBASE_CURRENCIES_URL = "https://api.exchange.coinbase.com/currencies"
+# Every US-listed stock and ETF symbol, Nasdaq and NYSE alike.
+US_STOCK_SYMBOLS_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt"
+# A short file is a bad download. Trusting it would let coins shadow stocks.
+MIN_US_STOCK_SYMBOLS = 5000
+LISTING_REFRESH_SECONDS = 6 * 3600
+LISTING_RETRY_SECONDS = 300
 # Native exchange intervals; 2m and 10m are aggregated from 1m and 5m.
 BINANCE_INTERVALS = {
     "d": "1d",
@@ -66,15 +79,99 @@ OKX_INTERVALS = {
 
 Ticker24h = tuple[float, float, int]  # last price, price 24h ago, epoch seconds
 
+# Tickers that chart as crypto without `;crypto`, and coin names for embeds.
+# refresh_crypto_listing() replaces both; MAIN_COINS covers startup.
+crypto_tickers: frozenset[str] = MAIN_COINS
+coin_names: dict[str, str] = {}
 
-def _crypto_market(request: ChartRequest) -> str:
-    if request.crypto_market != "auto":
-        return request.crypto_market or "spot"
-    return "perp" if is_intraday(request.timeframe) else "spot"
+
+def _binance_symbol(ticker: str) -> str:
+    return f"{ticker}USDT"
 
 
 def _okx_inst_id(ticker: str) -> str:
-    return CRYPTO_SYMBOLS[ticker][0].replace("USDT", "-USDT-SWAP")
+    return f"{ticker}-USDT-SWAP"
+
+
+def _pair_name(ticker: str) -> str:
+    return f"{coin_names.get(ticker, ticker)} / TetherUS"
+
+
+async def _fetch_text(session: aiohttp.ClientSession, url: str) -> str:
+    async with session.get(url, headers={"Accept": "text/plain"}) as response:
+        if response.status != 200:
+            raise MarketDataHTTPError(response.status)
+        return await response.text()
+
+
+async def _fetch_coin_names(session: aiohttp.ClientSession) -> dict[str, str]:
+    try:
+        data = await request_json(session, COINBASE_CURRENCIES_URL)
+    except PROVIDER_ERRORS:
+        return {}
+    if not isinstance(data, list):
+        return {}
+    return {
+        str(row["id"]): str(row["name"])
+        for row in data
+        if isinstance(row, dict) and row.get("id") and row.get("name")
+    }
+
+
+async def _fetch_crypto_listing(
+    session: aiohttp.ClientSession,
+) -> tuple[frozenset[str], dict[str, str]]:
+    """Coins on Binance spot or OKX perps, minus US stock and index tickers."""
+    binance, okx, stock_file, names = await asyncio.gather(
+        request_json(
+            session,
+            f"{BINANCE_SPOT_BASE_URL}/api/v3/exchangeInfo",
+            params={"permissions": "SPOT"},
+        ),
+        request_json(
+            session, f"{OKX_BASE_URL}/api/v5/public/instruments", params={"instType": "SWAP"}
+        ),
+        _fetch_text(session, US_STOCK_SYMBOLS_URL),
+        _fetch_coin_names(session),
+    )
+    coins = {
+        str(row.get("baseAsset"))
+        for row in (binance.get("symbols") if isinstance(binance, dict) else None) or []
+        if isinstance(row, dict)
+        and row.get("quoteAsset") == "USDT"
+        and row.get("status") == "TRADING"
+    }
+    coins |= {
+        str(row.get("instId")).removesuffix("-USDT-SWAP")
+        for row in (okx.get("data") if isinstance(okx, dict) else None) or []
+        if isinstance(row, dict)
+        and str(row.get("instId")).endswith("-USDT-SWAP")
+        and row.get("instCategory") == OKX_CRYPTO_CATEGORY
+        and row.get("state") == "live"
+    }
+    # Pipe-separated with a header line; the symbol is the second field.
+    stocks = {
+        line.split("|")[1] for line in stock_file.splitlines()[1:] if line.count("|") > 3
+    }
+    if len(stocks) < MIN_US_STOCK_SYMBOLS:
+        raise MarketDataProviderError("US stock symbol list looks incomplete")
+    return MAIN_COINS | (coins - stocks - YAHOO_SYMBOL_ALIASES.keys()), names
+
+
+async def refresh_crypto_listing(session: aiohttp.ClientSession) -> None:
+    """Keep `crypto_tickers` and `coin_names` current for the life of the bot."""
+    global crypto_tickers, coin_names
+    while True:
+        try:
+            tickers, names = await _fetch_crypto_listing(session)
+        except PROVIDER_ERRORS as error:
+            LOGGER.warning("crypto_listing outcome=error error_type=%s", type(error).__name__)
+            delay = LISTING_RETRY_SECONDS
+        else:
+            crypto_tickers, coin_names = tickers, names or coin_names
+            LOGGER.info("crypto_listing outcome=success coins=%d", len(tickers))
+            delay = LISTING_REFRESH_SECONDS
+        await asyncio.sleep(delay)
 
 
 def _history_start_ms(request: ChartRequest, interval_seconds: int) -> int | None:
@@ -118,37 +215,34 @@ def _kline_chart_rows(rows: list[list[Any]], volume_index: int) -> tuple[ChartRo
 
 
 async def _fetch_binance_klines(
-    session: aiohttp.ClientSession,
-    request: ChartRequest,
-    market: str,
+    session: aiohttp.ClientSession, request: ChartRequest
 ) -> list[list[Any]]:
-    symbol = CRYPTO_SYMBOLS[request.ticker][0]
     native = native_timeframe(request.timeframe, BINANCE_INTERVALS)
-    limit = BINANCE_KLINE_LIMITS[market]
-    base_url = BINANCE_FUTURES_BASE_URL if market == "perp" else BINANCE_SPOT_BASE_URL
-    path = "/fapi/v1/klines" if market == "perp" else "/api/v3/klines"
     rows: list[list[Any]] = []
     start_time = _history_start_ms(request, TIMEFRAMES[native].seconds)
 
     while True:
         params: dict[str, Any] = {
-            "symbol": symbol,
+            "symbol": _binance_symbol(request.ticker),
             "interval": BINANCE_INTERVALS[native],
-            "limit": limit,
+            "limit": BINANCE_KLINE_LIMIT,
         }
         if start_time is not None:
             params["startTime"] = start_time
         try:
-            data = await request_json(session, f"{base_url}{path}", params=params)
+            data = await request_json(
+                session, f"{BINANCE_SPOT_BASE_URL}/api/v3/klines", params=params
+            )
         except MarketDataHTTPError as error:
-            if error.status == 404:
+            # Binance answers an unknown symbol with 400.
+            if error.status in (400, 404):
                 raise NoChartData(f"No chart data found for `{request.ticker}`.") from error
             raise
         if not isinstance(data, list) or not data:
             break
         page = [row for row in data if isinstance(row, list) and len(row) >= 6]
         rows.extend(page)
-        if start_time is None or len(data) < limit or not page:
+        if start_time is None or len(data) < BINANCE_KLINE_LIMIT or not page:
             break
         next_start_time = int(page[-1][0]) + 1
         if next_start_time <= start_time or next_start_time >= int(time.time() * 1000):
@@ -184,6 +278,8 @@ async def _fetch_okx_swap_klines(
             if error.status == 404:
                 raise NoChartData(f"No chart data found for `{request.ticker}`.") from error
             raise
+        if isinstance(data, dict) and data.get("code") == OKX_UNKNOWN_INSTRUMENT:
+            raise NoChartData(f"No chart data found for `{request.ticker}`.")
         if not isinstance(data, dict) or data.get("code") != "0":
             raise MarketDataProviderError("Market data provider returned an error")
         page = data.get("data") or []
@@ -213,15 +309,13 @@ async def _fetch_okx_swap_klines(
 
 
 async def _fetch_binance_24h_ticker(
-    session: aiohttp.ClientSession,
-    request: ChartRequest,
-    market: str,
+    session: aiohttp.ClientSession, request: ChartRequest
 ) -> Ticker24h | None:
-    base_url = BINANCE_FUTURES_BASE_URL if market == "perp" else BINANCE_SPOT_BASE_URL
-    path = "/fapi/v1/ticker/24hr" if market == "perp" else "/api/v3/ticker/24hr"
     try:
         data = await request_json(
-            session, f"{base_url}{path}", params={"symbol": CRYPTO_SYMBOLS[request.ticker][0]}
+            session,
+            f"{BINANCE_SPOT_BASE_URL}/api/v3/ticker/24hr",
+            params={"symbol": _binance_symbol(request.ticker)},
         )
     except PROVIDER_ERRORS:
         return None
@@ -291,36 +385,51 @@ def _crypto_chart_data(
     return aggregate_chart_data(data, request)
 
 
-async def fetch_crypto_chart_data(
+async def _okx_chart_data(session: aiohttp.ClientSession, request: ChartRequest) -> ChartData:
+    async with background(_fetch_okx_24h_ticker(session, request)) as ticker_task:
+        rows = await _fetch_okx_swap_klines(session, request)
+        ticker_24h = await ticker_task
+    return _crypto_chart_data(
+        request,
+        _kline_chart_rows(rows, volume_index=6),  # base-currency volume
+        ticker_24h,
+        name=f"{_pair_name(request.ticker)} perpetual ({_okx_inst_id(request.ticker)}, OKX)",
+        market_label="OKX perp",
+        native=native_timeframe(request.timeframe, OKX_INTERVALS),
+    )
+
+
+async def _binance_chart_data(
     session: aiohttp.ClientSession, request: ChartRequest
 ) -> ChartData:
-    market = _crypto_market(request)
-    symbol, display_name = CRYPTO_SYMBOLS[request.ticker]
-    if market == "perp":
-        try:
-            async with background(_fetch_okx_24h_ticker(session, request)) as ticker_task:
-                rows = await _fetch_okx_swap_klines(session, request)
-                ticker_24h = await ticker_task
-        except PROVIDER_ERRORS:
-            LOGGER.info("provider_fallback source=okx target=binance market=perp")
-        else:
-            return _crypto_chart_data(
-                request,
-                _kline_chart_rows(rows, volume_index=6),  # base-currency volume
-                ticker_24h,
-                name=f"{display_name} perpetual ({_okx_inst_id(request.ticker)}, OKX)",
-                market_label="OKX perp",
-                native=native_timeframe(request.timeframe, OKX_INTERVALS),
-            )
-
-    async with background(_fetch_binance_24h_ticker(session, request, market)) as ticker_task:
-        rows = await _fetch_binance_klines(session, request, market)
+    async with background(_fetch_binance_24h_ticker(session, request)) as ticker_task:
+        rows = await _fetch_binance_klines(session, request)
         ticker_24h = await ticker_task
     return _crypto_chart_data(
         request,
         _kline_chart_rows(rows, volume_index=5),
         ticker_24h,
-        name=f"{display_name} {market} ({symbol}, Binance)",
-        market_label=f"Binance {market}",
+        name=f"{_pair_name(request.ticker)} spot ({_binance_symbol(request.ticker)}, Binance)",
+        market_label="Binance spot",
         native=native_timeframe(request.timeframe, BINANCE_INTERVALS),
     )
+
+
+async def fetch_crypto_chart_data(
+    session: aiohttp.ClientSession, request: ChartRequest
+) -> ChartData:
+    sources = [("okx", _okx_chart_data), ("binance", _binance_chart_data)]
+    if not is_intraday(request.timeframe):
+        sources.reverse()
+    (source, fetch), (target, fallback) = sources
+    try:
+        return await fetch(session, request)
+    except (*PROVIDER_ERRORS, NoChartData) as error:
+        LOGGER.info(
+            "provider_fallback source=%s target=%s ticker=%s error_type=%s",
+            source,
+            target,
+            request.ticker,
+            type(error).__name__,
+        )
+    return await fallback(session, request)

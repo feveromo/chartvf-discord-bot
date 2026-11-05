@@ -11,6 +11,7 @@ import aiohttp
 import discord
 from dotenv import load_dotenv
 
+import crypto
 from charting import (
     HELP_COMMANDS,
     PREFIX,
@@ -30,6 +31,7 @@ HELP_TEXT = """**ChartVF**
 **Syntax**
 `;TICKER [timeframe] [type] [range] [theme] [scale]` — stocks
 `;fut ROOT [timeframe] [type] [range] [theme] [scale]` — futures
+`;crypto COIN [options]` — any coin, even one that shares a stock ticker
 
 **Examples**
 `;AAPL` → latest 5-minute candle chart
@@ -43,8 +45,8 @@ HELP_TEXT = """**ChartVF**
 `;fut ES 15` → E-mini S&P 15-minute chart
 `;fut CL w line` → crude oil weekly line
 `;futures GC 1y` → gold 1-year chart
-Crypto: `;BTC`, `;BTC d`, `;ETH`, `;ETH 1y percent`, `;DOGE`, `;DOGE d`
-Crypto history: `;BTC max`, `;ETH max`, `;DOGE max`
+Crypto: `;BTC`, `;ETH 1y percent`, `;XLM d`, `;PEPE 15`, `;BTC max`
+Coin vs stock: `;LINK` is Interlink; `;crypto LINK`, `;LINK-USD`, or `;chainlink` is the coin
 Indexes: `;SPX`, `;NDX`, `;DJX`/`;DJI`/`;DJIA`, `;RUT`, `;RUI`, `;VIX`, `;IXIC`, `;OEX`
 
 **Options** (same for stocks and futures)
@@ -61,14 +63,10 @@ Options can be in any order after the ticker.
 
 **Faces**: `;)`, `;p`, and `;D` on their own are left alone; `;d` or `;D d` charts Dominion.
 
-**Freshness**: bare stock, futures, and crypto commands default to the latest 5-minute chart.
-Stock intraday charts use real-time Webull candles (tick-level push, pre/post market included),
-with TradingView 24-hour candles as fallback.
-Supported futures intraday charts use delayed TradingView continuous-contract candles.
-Crypto intraday charts use perp data; crypto daily/weekly/monthly and range charts use Binance spot
-OHLCV history. Crypto change figures are rolling 24-hour values. `;BTC max` fetches all available
-Binance spot chart history. Every chart image is
-rendered locally from market chart data.
+**Data**: bare commands show the latest 5-minute chart.
+Stock intraday: real-time Webull (pre/post market included), TradingView 24-hour fallback.
+Futures intraday: delayed TradingView continuous contracts.
+Crypto: every coin on Binance spot or OKX perps; OKX perp intraday, Binance spot history, rolling 24-hour change.
 """
 
 # Budget for the network fetch only; rendering is local and fast.
@@ -91,14 +89,22 @@ class ChartBot(discord.Client):
         super().__init__(intents=intents, max_messages=0, allowed_mentions=NO_MENTIONS)
         self.session: aiohttp.ClientSession | None = None
         self.webull_streamer: WebullStreamer | None = None
+        self.crypto_listing_task: asyncio.Task[None] | None = None
         self.render_pool = ThreadPoolExecutor(RENDER_WORKERS, thread_name_prefix="render")
 
     async def setup_hook(self) -> None:
         self.session = create_session()
         # Connects on the first stock intraday chart, not at startup.
         self.webull_streamer = WebullStreamer()
+        self.crypto_listing_task = asyncio.create_task(
+            crypto.refresh_crypto_listing(self.session)
+        )
 
     async def close(self) -> None:
+        if self.crypto_listing_task is not None:
+            self.crypto_listing_task.cancel()
+            await asyncio.gather(self.crypto_listing_task, return_exceptions=True)
+            self.crypto_listing_task = None
         if self.webull_streamer is not None:
             self.webull_streamer.stop()
             self.webull_streamer = None
@@ -121,7 +127,7 @@ class ChartBot(discord.Client):
             await message.channel.send(HELP_TEXT)
             return
         try:
-            request = parse_chart_command(message.content)
+            request = parse_chart_command(message.content, crypto.crypto_tickers)
         except ValueError as error:
             await message.channel.send(str(error))
             return

@@ -7,9 +7,14 @@ from typing import Any, cast
 import aiohttp
 
 from charting import ChartRequest, NoChartData
-from crypto import _fetch_binance_klines, fetch_crypto_chart_data
+from crypto import (
+    MIN_US_STOCK_SYMBOLS,
+    _fetch_binance_klines,
+    _fetch_crypto_listing,
+    fetch_crypto_chart_data,
+)
 from market_data import fetch_market_chart_data
-from market_http import MarketDataHTTPError, request_json
+from market_http import MarketDataHTTPError, MarketDataProviderError, request_json
 from webull import _resolution_cache
 
 
@@ -32,6 +37,9 @@ class FakeResponse:
         if isinstance(self.payload, BaseException):
             raise self.payload
         return self.payload
+
+    async def text(self) -> str:
+        return str(self.payload)
 
 
 class FakeWebSocketMessage:
@@ -396,12 +404,74 @@ async def test_binance_five_year_history_paginates_through_cutoff() -> None:
         date_range_label="5 years",
         crypto_market="auto",
     )
-    rows = await _fetch_binance_klines(session, request, "spot")
+    rows = await _fetch_binance_klines(session, request)
     requested_cutoff = now_ms - 1826 * day_ms
     assert rows[0][0] <= requested_cutoff - 198 * day_ms
     assert rows[-1][0] >= now_ms - day_ms
     assert len(fake.calls) >= 3
     assert len({int(row[0]) for row in rows}) == len(rows)
+
+
+async def test_coin_missing_from_okx_falls_back_to_binance_spot() -> None:
+    rows = [
+        [1780000000000, "98", "101", "97", "100", "10"],
+        [1780000300000, "100", "102", "99", "101", "11"],
+    ]
+
+    def route(url: str, _params: dict[str, Any] | None) -> FakeResponse:
+        if "okx" in url:
+            return FakeResponse(200, {"code": "51001", "data": [], "msg": "doesn't exist"})
+        if url.endswith("/klines"):
+            return FakeResponse(200, rows)
+        return FakeResponse(200, {"lastPrice": "102", "openPrice": "100"})
+
+    session, _fake = session_for(route)
+    data = await fetch_crypto_chart_data(session, ChartRequest("XLM", "i5", "5 min", crypto_market="auto"))
+    assert data.market_label == "Binance spot"
+    assert data.name == "XLM / TetherUS spot (XLMUSDT, Binance)"
+    assert data.change == 2.0
+
+
+async def test_crypto_listing_lets_stocks_and_indexes_win() -> None:
+    stock_file = "\n".join(
+        ["Nasdaq Traded|Symbol|Security Name|Listing Exchange|Market Category"]
+        + [f"Y|S{index}|Stock|Q|Q" for index in range(MIN_US_STOCK_SYMBOLS)]
+        + ["Y|LINK|Interlink Electronics|Q|Q", "Y|BTC|Grayscale Bitcoin Mini Trust|P| "]
+    )
+
+    def route(url: str, _params: dict[str, Any] | None) -> FakeResponse:
+        if url.endswith("/exchangeInfo"):
+            symbols = [
+                {"baseAsset": base, "quoteAsset": "USDT", "status": "TRADING"}
+                for base in ("BTC", "XLM", "LINK", "SPX")
+            ]
+            return FakeResponse(200, {"symbols": symbols})
+        if url.endswith("/instruments"):
+            instruments = [
+                {"instId": "PEPE-USDT-SWAP", "instCategory": "1", "state": "live"},
+                {"instId": "AAPLX-USDT-SWAP", "instCategory": "3", "state": "live"},
+            ]
+            return FakeResponse(200, {"code": "0", "data": instruments})
+        if url.endswith("/currencies"):
+            return FakeResponse(200, [{"id": "XLM", "name": "Stellar"}])
+        return FakeResponse(200, stock_file)
+
+    session, _fake = session_for(route)
+    tickers, names = await _fetch_crypto_listing(session)
+    assert {"BTC", "XLM", "PEPE"} <= tickers
+    assert not {"LINK", "SPX", "AAPLX", "S1"} & tickers
+    assert names == {"XLM": "Stellar"}
+
+    def short_stock_file(url: str, params: dict[str, Any] | None) -> FakeResponse:
+        return FakeResponse(200, "header\nY|F|Ford|N|") if "nasdaqtrader" in url else route(url, params)
+
+    session, _fake = session_for(short_stock_file)
+    try:
+        await _fetch_crypto_listing(session)
+    except MarketDataProviderError:
+        pass
+    else:
+        raise AssertionError("an incomplete stock list must not replace the coin list")
 
 
 async def run_tests() -> None:
@@ -414,6 +484,8 @@ async def run_tests() -> None:
     await test_okx_is_primary_for_perp_and_uses_rolling_24h_change()
     await test_ticker_failure_does_not_fake_candle_change()
     await test_binance_five_year_history_paginates_through_cutoff()
+    await test_coin_missing_from_okx_falls_back_to_binance_spot()
+    await test_crypto_listing_lets_stocks_and_indexes_win()
 
 
 if __name__ == "__main__":

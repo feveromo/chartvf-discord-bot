@@ -144,17 +144,29 @@ DATE_RANGES = {
 }
 DATE_RANGE_DAYS = {"m1": 31, "m3": 93, "m6": 186, "y1": 365, "y2": 730, "y5": 1826}
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,14}$")
+CRYPTO_TICKER_RE = re.compile(r"^[A-Z0-9]{1,15}$")
+# Coin names chart the coin even when a stock has its ticker (`;litecoin`).
 CRYPTO_TICKER_ALIASES = {
     "BITCOIN": "BTC",
     "ETHEREUM": "ETH",
     "ETHER": "ETH",
     "DOGECOIN": "DOGE",
+    "SOLANA": "SOL",
+    "RIPPLE": "XRP",
+    "STELLAR": "XLM",
+    "CARDANO": "ADA",
+    "LITECOIN": "LTC",
+    "CHAINLINK": "LINK",
 }
-CRYPTO_SYMBOLS = {
-    "BTC": ("BTCUSDT", "Bitcoin / TetherUS"),
-    "ETH": ("ETHUSDT", "Ethereum / TetherUS"),
-    "DOGE": ("DOGEUSDT", "Dogecoin / TetherUS"),
-}
+# Coins that always chart as crypto, even before the exchange listings load.
+# BTC, ETH and XRP also beat the US-listed ETFs that share their tickers.
+MAIN_COINS = frozenset({
+    "BTC", "ETH", "XRP", "SOL", "BNB", "DOGE", "ADA", "XLM", "AVAX", "HBAR",
+    "DOT", "SHIB", "UNI", "PEPE", "ICP", "ETC", "AAVE", "POL", "ALGO", "OP",
+    "RENDER", "INJ", "TIA", "TAO", "WLD", "BONK", "WIF", "ENA", "ONDO", "JUP",
+    "HYPE", "TRUMP", "FIL", "GRT", "IMX", "CRV", "LDO", "PENGU", "FLOKI",
+})
+CRYPTO_ALIASES = frozenset({"crypto"})
 # `;p`, `;P` and `;D` are faces, not charts, unless chart options follow
 # (`;D d` still charts Dominion Energy daily).
 FACE_TOKENS = frozenset({"p", "P", "D"})
@@ -276,8 +288,13 @@ def native_timeframe(timeframe: str, supported: Collection[str]) -> str:
     return max(divisors, key=lambda code: TIMEFRAMES[code].seconds)
 
 
-def parse_chart_command(content: str) -> ChartRequest | None:
-    """Parse `;TICKER [options]`. None means the message is not a chart command."""
+def parse_chart_command(
+    content: str, crypto_tickers: Collection[str] = MAIN_COINS
+) -> ChartRequest | None:
+    """Parse `;TICKER [options]`. None means the message is not a chart command.
+
+    `crypto_tickers` chart as crypto without `;crypto`, `-USD`, or a coin name.
+    """
     if not content.startswith(PREFIX):
         return None
     parts = content[len(PREFIX):].split()
@@ -286,41 +303,51 @@ def parse_chart_command(content: str) -> ChartRequest | None:
 
     command = parts[0].lower()
     futures = command in FUTURES_ALIASES
-    explicit = futures or command in CHART_ALIASES
+    crypto = command in CRYPTO_ALIASES
+    explicit = futures or crypto or command in CHART_ALIASES
     if explicit:
         parts = parts[1:]
         if not parts:
-            raise ValueError(
-                "Usage: `;fut ES`, `;fut CL w line`, or `;futures GC 1y`"
-                if futures
-                else "Usage: `;AAPL`, `;AAPL w`, or `;AAPL m line dark log`"
-            )
+            if futures:
+                raise ValueError("Usage: `;fut ES`, `;fut CL w line`, or `;futures GC 1y`")
+            if crypto:
+                raise ValueError("Usage: `;crypto LINK`, `;crypto SUI d`, or `;crypto 1INCH 1y`")
+            raise ValueError("Usage: `;AAPL`, `;AAPL w`, or `;AAPL m line dark log`")
 
     raw_ticker, options = parts[0], parts[1:]
     ticker = raw_ticker.upper().replace(".", "-")
     if futures:
         if not FUTURES_TICKER_RE.fullmatch(ticker):
             raise ValueError("Futures root looks wrong. Use roots like `;fut ES`, `;fut CL`, or `;fut 6E`.")
+    elif crypto:
+        ticker = CRYPTO_TICKER_ALIASES.get(ticker, ticker).removesuffix("-USD")
+        if not CRYPTO_TICKER_RE.fullmatch(ticker):
+            raise ValueError("Coin ticker looks wrong. Use coins like `;crypto LINK` or `;crypto 1INCH`.")
     elif not TICKER_RE.fullmatch(ticker):
         if explicit:
             raise ValueError("Ticker looks wrong. Use letters/numbers only, like `;AAPL` or `;BRK-B`.")
         return None  # chatter such as `;)` or `;_;`
+    elif ticker in CRYPTO_TICKER_ALIASES:
+        ticker, crypto = CRYPTO_TICKER_ALIASES[ticker], True
+    elif ticker.endswith("-USD"):
+        ticker, crypto = ticker.removesuffix("-USD"), True
     else:
-        ticker = CRYPTO_TICKER_ALIASES.get(ticker, ticker)
+        crypto = ticker in crypto_tickers
 
     face = not explicit and raw_ticker in FACE_TOKENS
     if face and not options:
         return None
     try:
-        return _parse_chart_options(ticker, options, futures=futures)
+        return _parse_chart_options(ticker, options, futures=futures, crypto=crypto)
     except ValueError:
         if face:
             return None  # `;p` followed by chatter
         raise
 
 
-def _parse_chart_options(ticker: str, options: list[str], *, futures: bool) -> ChartRequest:
-    crypto = not futures and ticker in CRYPTO_SYMBOLS
+def _parse_chart_options(
+    ticker: str, options: list[str], *, futures: bool, crypto: bool
+) -> ChartRequest:
     timeframe: str | None = None
     chart_type, chart_type_label = CHART_TYPES[DEFAULT_CHART_TYPE]
     theme, theme_label = THEMES[DEFAULT_THEME]

@@ -12,6 +12,7 @@ Nothing else.
 ```text
 ;TICKER [timeframe] [type] [range] [theme] [scale]      stocks
 ;fut ROOT [timeframe] [type] [range] [theme] [scale]    futures
+;crypto COIN [timeframe] [type] [range] [theme] [scale] any coin
 ```
 
 Options can be in any order after the ticker.
@@ -31,7 +32,10 @@ Options can be in any order after the ticker.
 | `;HIMS w vp` | weekly chart with volume profile |
 | `;BTC d` | Bitcoin daily chart |
 | `;ETH 1y percent` | Ethereum 1-year percent chart |
-| `;DOGE d` | Dogecoin daily chart |
+| `;XLM d` | Stellar daily chart |
+| `;PEPE 15` | Pepe 15-minute perpetual chart |
+| `;crypto LINK` | Chainlink; `;LINK` alone is Interlink Electronics |
+| `;LINK-USD`, `;chainlink` | Chainlink too |
 | `;BTC 5` | Bitcoin 5-minute perpetual chart |
 | `;BTC max` | full available Binance spot Bitcoin chart history with volume |
 | `;fut ES` | E-mini S&P futures |
@@ -64,9 +68,22 @@ POC price is listed under the SMA legend.
 Bare stock and crypto commands default to the latest 5-minute chart. U.S. stock
 intraday charts use real-time Webull candles (anonymous tick-level stream plus native interval history,
 pre/post market included), with TradingView 24-hour candles as fallback. Crypto intraday charts use
-perpetual data; crypto daily/weekly/monthly and range charts use Binance spot OHLCV history.
-Crypto embeds show rolling 24-hour price changes consistently across timeframes. Use `;BTC max`
-for full available Binance spot history with volume.
+OKX perpetual data; crypto daily/weekly/monthly and range charts use Binance spot OHLCV history.
+Each falls back to the other. Crypto embeds show rolling 24-hour price changes consistently across
+timeframes. Use `;BTC max` for full available Binance spot history with volume.
+
+## Crypto
+
+Every coin with a USDT pair on Binance spot or OKX perpetuals charts. The bot loads those
+listings at startup and every 6 hours. It also loads the Nasdaq Trader list of US-listed
+symbols, so that a stock or index wins when it shares a coin's ticker: `;LINK` is Interlink
+Electronics, `;SUI` is Sun Communities, and `;SPX` is the S&P 500. Use `;crypto LINK`,
+`;LINK-USD`, or a coin name such as `;chainlink` or `;litecoin` for the coin. A short built-in
+list of major coins (`MAIN_COINS` in `charting.py`) always charts as crypto. This list also
+makes `BTC`, `ETH` and `XRP` beat the ETFs that use those tickers. Coin names come from
+Coinbase. None of these sources needs an API key.
+
+Binance blocks its futures API from US hosts, so the bot uses Binance spot only.
 
 ## Futures
 
